@@ -53,6 +53,30 @@ interface SubagentRecord {
 	status?: string;
 }
 
+interface RequestMetric {
+	ttftMs?: number;
+	tps?: number;
+	durationMs?: number;
+	inputTokens?: number;
+	outputTokens?: number;
+	cacheReadTokens?: number;
+}
+
+interface SubagentMetric {
+	tokens?: number;
+	tokensUsed?: number;
+}
+
+export interface SessionAverages {
+	requests: number;
+	subagents: number;
+	avgTtftMs?: number;
+	avgTps?: number;
+	avgDurationMs?: number;
+	cachePercent?: number;
+	totalTokens: number;
+}
+
 interface TextNode {
 	type: 'text';
 	text: string;
@@ -123,6 +147,51 @@ export function formatPercent(percent: number | undefined): string {
 	if (percent === undefined || !Number.isFinite(percent)) return '—';
 	if (percent > 0 && percent < 10) return `${percent.toFixed(1)}%`;
 	return `${Math.round(percent)}%`;
+}
+
+const averageOf = (values: number[]): number | undefined =>
+	values.length === 0 ? undefined : values.reduce((sum, value) => sum + value, 0) / values.length;
+
+// Session aggregates. TTFT, TPS and duration average the parent model requests only, so the
+// approximate sub-agent TTFT (spawn → first forwarded event) cannot dilute a measured one.
+// The cache rate is token-weighted and request-only; a child carries no prompt accounting.
+// totalTokens sums every usage figure seen in the session, parent requests and sub-agents
+// alike, because each is its own inference call billed on its own tokens.
+export function sessionAverages(
+	requests: RequestMetric[],
+	subagents: SubagentMetric[] = [],
+): SessionAverages {
+	const totalInput = requests.reduce((sum, record) => sum + (record.inputTokens ?? 0), 0);
+	const totalCacheRead = requests.reduce((sum, record) => sum + (record.cacheReadTokens ?? 0), 0);
+	const requestTokens = requests.reduce(
+		(sum, record) => sum + (record.inputTokens ?? 0) + (record.outputTokens ?? 0),
+		0,
+	);
+	const subagentTokens = subagents.reduce(
+		(sum, subagent) => sum + (subagent.tokensUsed ?? subagent.tokens ?? 0),
+		0,
+	);
+	const averages: SessionAverages = {
+		requests: requests.length,
+		subagents: subagents.length,
+		totalTokens: requestTokens + subagentTokens,
+	};
+	const avgTtftMs = averageOf(
+		requests.map(record => record.ttftMs).filter((ttft): ttft is number => ttft !== undefined),
+	);
+	if (avgTtftMs !== undefined) averages.avgTtftMs = avgTtftMs;
+	const avgTps = averageOf(
+		requests.map(record => record.tps).filter((tps): tps is number => tps !== undefined),
+	);
+	if (avgTps !== undefined) averages.avgTps = avgTps;
+	const avgDurationMs = averageOf(
+		requests
+			.map(record => record.durationMs)
+			.filter((duration): duration is number => duration !== undefined),
+	);
+	if (avgDurationMs !== undefined) averages.avgDurationMs = avgDurationMs;
+	if (totalInput > 0) averages.cachePercent = (totalCacheRead / totalInput) * 100;
+	return averages;
 }
 
 export function parseUsageBlock(text: string): {
@@ -287,35 +356,46 @@ export default function (cmd: ModApi): void {
 
 	const summaryLine = (): string => {
 		if (history.length === 0) return 'metrics: no completed model requests yet';
-		const rates = history.map(record => record.tps).filter((tps): tps is number => tps !== undefined);
-		const ttfts = history
-			.map(record => record.ttftMs)
-			.filter((ttft): ttft is number => ttft !== undefined);
-		const average = (values: number[]): number =>
-			values.reduce((sum, value) => sum + value, 0) / values.length;
-		const parts = [`metrics: ${history.length} request(s)`];
-		if (rates.length > 0) parts.push(`avg ${formatRate(average(rates))}`);
-		if (ttfts.length > 0) parts.push(`avg TTFT ${formatDuration(average(ttfts))}`);
-		// Session cache hit rate is a token-weighted ratio, not an average of percentages:
-		// many small cold requests must not outweigh one big warm prompt.
-		const totalInput = history.reduce((sum, record) => sum + (record.inputTokens ?? 0), 0);
-		const totalCacheRead = history.reduce((sum, record) => sum + (record.cacheReadTokens ?? 0), 0);
-		if (totalInput > 0)
-			parts.push(`cache ${formatPercent((totalCacheRead / totalInput) * 100)}`);
-		if (subagents.size > 0) {
+		const stats = sessionAverages(history, [...subagents.values()]);
+		const parts = [`metrics: ${stats.requests} request(s)`];
+		if (stats.avgTtftMs !== undefined) parts.push(`avg TTFT ${formatDuration(stats.avgTtftMs)}`);
+		if (stats.avgTps !== undefined) parts.push(`avg ${formatRate(stats.avgTps)}`);
+		if (stats.avgDurationMs !== undefined)
+			parts.push(`avg duration ${formatDuration(stats.avgDurationMs)}`);
+		if (stats.cachePercent !== undefined) parts.push(`cache ${formatPercent(stats.cachePercent)}`);
+		parts.push(`total ${formatTokens(stats.totalTokens)} tok`);
+		if (stats.subagents > 0) {
 			const subagentTtfts = [...subagents.values()]
 				.map(subagent => subagent.ttftMs)
 				.filter((ttft): ttft is number => ttft !== undefined);
 			const subagentRates = [...subagents.values()]
 				.map(subagent => subagentRate(subagent))
 				.filter((tps): tps is number => tps !== undefined);
-			let subagentPart = `${subagents.size} sub-agent(s)`;
-			if (subagentTtfts.length > 0)
-				subagentPart += ` avg TTFT ${formatDuration(average(subagentTtfts))}`;
-			if (subagentRates.length > 0) subagentPart += ` avg ${formatRate(average(subagentRates))}`;
+			let subagentPart = `${stats.subagents} sub-agent(s)`;
+			const subagentAvgTtft = averageOf(subagentTtfts);
+			if (subagentAvgTtft !== undefined)
+				subagentPart += ` avg TTFT ${formatDuration(subagentAvgTtft)}`;
+			const subagentAvgRate = averageOf(subagentRates);
+			if (subagentAvgRate !== undefined) subagentPart += ` avg ${formatRate(subagentAvgRate)}`;
 			parts.push(subagentPart);
 		}
 		return parts.join(' · ');
+	};
+
+	const avgWidgetLines = (): Line[] => {
+		if (history.length === 0) return [];
+		const stats = sessionAverages(history, [...subagents.values()]);
+		const nodes: TextNode[] = [{type: 'text', text: 'session', dim: true}];
+		if (stats.avgTtftMs !== undefined)
+			nodes.push({type: 'text', text: `TTFT ${formatDuration(stats.avgTtftMs)}`, color: 'green'});
+		if (stats.avgTps !== undefined)
+			nodes.push({type: 'text', text: formatRate(stats.avgTps), color: 'cyan'});
+		if (stats.avgDurationMs !== undefined)
+			nodes.push({type: 'text', text: `⏱ ${formatDuration(stats.avgDurationMs)}`, color: 'white'});
+		if (stats.cachePercent !== undefined)
+			nodes.push({type: 'text', text: `cache ${formatPercent(stats.cachePercent)}`, color: 'yellow'});
+		nodes.push({type: 'text', text: `${formatTokens(stats.totalTokens)} tok`, color: 'magenta'});
+		return [{type: 'row', children: nodes}];
 	};
 
 	const requestLines = (): Line[] => {
@@ -429,6 +509,11 @@ export default function (cmd: ModApi): void {
 		const nodes = spinnerNodes(Date.now(), Number(props.tokens) || 0);
 		if (nodes.length === 0) return undefined;
 		return [...nodes, ...(next?.() ?? [])];
+	});
+
+	cmd.ui.widget({
+		placement: 'below-editor',
+		render: () => avgWidgetLines(),
 	});
 
 	cmd.ui.pane({

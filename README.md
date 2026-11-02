@@ -11,6 +11,27 @@ model works.
 | **tokens ÷ (duration − TTFT)** | The rate reported for a finished request, so prefill does not dilute it. |
 | **cache %** | `cacheReadTokens ÷ inputTokens` — how much of the prompt was served from the prompt cache. |
 
+## Session averages
+
+A line under the prompt (`below-editor`) keeps the running averages for the session in view,
+so the per-request numbers on the spinner never hide the trend:
+
+```
+session TTFT 1.8s  87 t/s  ⏱ 3.4s  cache 51%  42k tok
+```
+
+| Field | Meaning |
+|---|---|
+| **TTFT** | Mean time to first token over completed model requests. |
+| **t/s** | Mean generated tokens per second, each request weighted equally. |
+| **⏱** | Mean wall time of a model request. |
+| **cache** | Token-weighted `ΣcacheRead ÷ Σinput` for the session. |
+| **tok** | Total tokens this session — input + output for every request, plus every sub-agent's tokens. |
+
+The averages stay request-only on purpose: a sub-agent's TTFT is approximate, so it is not
+mixed into a measured one. Its tokens still count toward the total, because each child is its
+own inference call. `/metrics` repeats the same figures as a one-line summary.
+
 ## Install
 
 ```bash
@@ -79,7 +100,7 @@ implying token-level precision. Its duration, token count and TPS are exact.
 ## Development
 
 ```bash
-npm test        # 22 unit tests, no build step (node --experimental-strip-types)
+npm test        # 27 unit tests, no build step (node --experimental-strip-types)
 npm run typecheck
 ```
 

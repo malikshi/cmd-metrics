@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cmd-metrics — how each number is measured</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#111822; --panel2:#0e151e; --line:#1e2b3a;
+    --ink:#e6edf5; --dim:#7d8fa5; --faint:#4a5c72;
+    --cyan:#22d3ee; --green:#34d399; --yellow:#fbbf24; --magenta:#e879f9;
+    --red:#f87171; --grey:#334155;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:
+      radial-gradient(900px 500px at 15% -10%, #14202e 0%, transparent 60%),
+      radial-gradient(700px 400px at 100% 0%, #1a1430 0%, transparent 55%),
+      var(--bg);
+    color:var(--ink);
+    font:14px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    padding:40px 22px 90px;
+  }
+  .wrap{max-width:1000px;margin:0 auto}
+  h1{font-size:23px;margin:0 0 6px;letter-spacing:-.4px}
+  h1 span{color:var(--cyan)}
+  .sub{color:var(--dim);margin:0 0 34px;font-size:13px}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:1.4px;color:var(--dim);
+     margin:44px 0 14px;font-weight:600;display:flex;gap:10px;align-items:center}
+  h2::before{content:"";width:5px;height:5px;background:var(--cyan);border-radius:50%}
+  .panel{background:linear-gradient(180deg,var(--panel) 0%,var(--panel2) 100%);
+         border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin-bottom:16px}
+  .cap{color:var(--faint);font-size:12px;margin-top:10px}
+  code{background:#1a2534;padding:1px 5px;border-radius:4px;font-size:12.5px;color:#cfe3f7}
+
+  /* ---------- timeline ---------- */
+  .trow{display:grid;grid-template-columns:132px 1fr;gap:14px;align-items:center;margin:0 0 12px}
+  .tname{font-size:12px;color:var(--dim);text-align:right}
+  .tname b{color:var(--ink);font-weight:600}
+  .track{position:relative;height:34px;background:#0a1017;border:1px solid var(--line);
+         border-radius:6px;overflow:hidden;display:flex}
+  .seg{height:100%;display:flex;align-items:center;justify-content:center;
+       font-size:11px;white-space:nowrap;overflow:hidden;
+       animation:grow .8s cubic-bezier(.2,.8,.2,1) both; transform-origin:left}
+  @keyframes grow{from{transform:scaleX(0);opacity:.3}to{transform:scaleX(1);opacity:1}}
+  .prefill{background:repeating-linear-gradient(135deg,#1c2836,#1c2836 6px,#18222f 6px,#18222f 12px);
+           color:var(--dim);border-right:1px dashed #2c3d52}
+  .gen{background:linear-gradient(90deg,#0e7490,#22d3ee);color:#03202a;font-weight:700}
+  .gen.slow{background:linear-gradient(90deg,#065f46,#34d399);color:#022c22}
+  .marker{position:absolute;top:-1px;bottom:-1px;width:2px;background:var(--yellow);
+          box-shadow:0 0 8px var(--yellow)}
+  .legend{display:flex;gap:20px;flex-wrap:wrap;font-size:12px;color:var(--dim);margin-top:16px}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;
+            vertical-align:-1px}
+  .formula{background:#0a1017;border:1px solid var(--line);border-radius:8px;
+           padding:12px 14px;margin-top:16px;font-size:12.5px;color:#b9cbe0;overflow-x:auto}
+  .formula b{color:var(--cyan);font-weight:600}
+
+  /* ---------- tables ---------- */
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{text-align:left;color:var(--faint);font-weight:600;font-size:11px;
+     text-transform:uppercase;letter-spacing:.8px;padding:0 10px 8px 0;
+     border-bottom:1px solid var(--line)}
+  td{padding:8px 10px 8px 0;border-bottom:1px solid #16202c;white-space:nowrap}
+  tr:last-child td{border-bottom:none}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .g{color:var(--green)} .c{color:var(--cyan)} .y{color:var(--yellow)}
+  .m{color:var(--magenta)} .d{color:var(--dim)}
+  .tot td{background:#0c1926;border-top:1px solid var(--line);border-bottom:none;font-weight:700}
+  .arithmetic{color:var(--faint);font-size:12px;margin-top:14px;line-height:1.9}
+  .arithmetic b{color:var(--ink);font-weight:600}
+
+  /* ---------- screen mockups ---------- */
+  .screen{background:#070c12;border:1px solid var(--line);border-radius:10px;padding:16px 18px;
+          font-size:12.5px;overflow-x:auto}
+  .screen .lbl{color:var(--faint);font-size:10.5px;text-transform:uppercase;
+               letter-spacing:1.2px;margin-bottom:9px}
+  .boxhr{border:none;border-top:1px dashed #1d2a38;margin:14px 0}
+  .spin{color:var(--dim)}
+  .spin .c{color:var(--cyan)} .spin .g{color:var(--green)}
+  .prompt{color:var(--ink)}
+  .prompt .cur{color:var(--cyan)}
+  .status{color:var(--faint);font-size:11.5px}
+  .alert{display:flex;gap:10px;background:#1a1410;border:1px solid #4a3418;
+         border-radius:8px;padding:12px 14px;font-size:12.5px;color:#e6d3b3;margin-bottom:16px}
+  .alert b{color:var(--yellow)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}.trow{grid-template-columns:96px 1fr}}
+  .tokbar{display:flex;height:30px;border-radius:6px;overflow:hidden;border:1px solid var(--line)}
+  .tokbar div{display:flex;align-items:center;justify-content:center;font-size:11px;
+              font-weight:700;animation:grow .8s cubic-bezier(.2,.8,.2,1) both;transform-origin:left}
+  .tokrow{display:flex;justify-content:space-between;font-size:12px;color:var(--dim);margin-top:8px}
+  .kv{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #16202c;font-size:12.5px}
+  .kv:last-child{border-bottom:none}
+  .kv span:first-child{color:var(--dim)}
+  .kv span:last-child{font-weight:600;font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>cmd-metrics <span>— what each number actually measures</span></h1>
+  <p class="sub">One model request has two phases. Every metric in the mod is a ratio of those phases.</p>
+
+  <!-- ================= 1. THE REQUEST ================= -->
+  <h2>1 · Anatomy of one model request</h2>
+  <div class="panel">
+    <div class="trow">
+      <div class="tname"><b>request</b><br>start → end</div>
+      <div class="track">
+        <div class="seg prefill" style="width:76.2%">prefill + thinking · TTFT 1.6s</div>
+        <div class="seg gen" style="width:23.8%">132 tok</div>
+        <div class="marker" style="left:76.2%"></div>
+      </div>
+    </div>
+    <div class="trow">
+      <div class="tname"><b>duration</b></div>
+      <div class="track" style="height:8px;background:none;border:none">
+        <div class="seg" style="width:100%;background:linear-gradient(90deg,#334155,#64748b);border-radius:4px"></div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <span><i style="background:#1c2836;border:1px dashed #2c3d52"></i>prefill — nothing to show yet</span>
+      <span><i style="background:linear-gradient(90deg,#0e7490,#22d3ee)"></i>generation — tokens streaming</span>
+      <span><i style="background:var(--yellow)"></i>first token (TTFT ends here)</span>
+    </div>
+
+    <div class="formula">
+      <b>TTFT</b> = first token time − request start &nbsp;=&nbsp; <b>1.6s</b><br>
+      <b>duration</b> = request end − request start &nbsp;=&nbsp; <b>2.1s</b><br>
+      <b>TPS</b> = outputTokens ÷ (duration − TTFT) = 132 ÷ (2.1 − 1.6) = 132 ÷ <b>0.5s</b> = <b>264 t/s</b>
+    </div>
+    <p class="cap">Why subtract TTFT? Prefill is not generation. Dividing 132 ÷ 2.1s would report 63 t/s
+      and blame the model for a slow prompt read. The mod never does that.</p>
+  </div>
+
+  <!-- ================= 2. CACHE ================= -->
+  <h2>2 · cache % — how much of the prompt was reused</h2>
+  <div class="panel">
+    <div class="tname" style="text-align:left;margin-bottom:6px">request #1 prompt · 27,947 input tokens</div>
+    <div class="tokbar">
+      <div style="width:51.3%;background:linear-gradient(90deg,#a16207,#fbbf24);color:#2a1a00">14,336 cache read · 51%</div>
+      <div style="width:48.7%;background:#243244;color:var(--dim)">13,611 fresh</div>
+    </div>
+    <div class="formula">
+      <b>cache %</b> = cacheReadTokens ÷ inputTokens = 14,336 ÷ 27,947 = <b>51%</b>
+    </div>
+    <p class="cap"><code>inputTokens</code> already counts cached tokens — Command Code subtracts cache reads
+      back out before pricing fresh input. So the divisor is the whole prompt, never the fresh slice.</p>
+  </div>
+
+  <!-- ================= 3. SESSION ================= -->
+  <h2>3 · A 3-request session, and where the averages come from</h2>
+  <div class="panel">
+    <table>
+      <thead>
+        <tr><th>#</th><th>TTFT</th><th>duration</th><th class="num">out tok</th><th>TPS</th><th>cache</th><th class="num">input</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="d">#1</td><td class="g">1.6s</td><td>2.1s</td><td class="num">132</td><td class="c">264 t/s</td><td class="y">51%</td><td class="num d">27,947</td></tr>
+        <tr><td class="d">#2</td><td class="g">1.7s</td><td>1.8s</td><td class="num">14</td><td class="c">140 t/s</td><td class="y">99%</td><td class="num d">15,000</td></tr>
+        <tr><td class="d">#3</td><td class="g">2.0s</td><td>4.0s</td><td class="num">200</td><td class="c">100 t/s</td><td class="y">40%</td><td class="num d">30,000</td></tr>
+        <tr class="tot"><td>session</td><td class="g">1.8s</td><td>2.6s</td><td class="num">·</td><td class="c">168 t/s</td><td class="y">56%</td><td class="num">72,947</td></tr>
+      </tbody>
+    </table>
+
+    <div class="arithmetic">
+      <b>avg TTFT</b> = (1.6 + 1.7 + 2.0) ÷ 3 = 5.3 ÷ 3 = <b>1.77s → 1.8s</b><br>
+      <b>avg TPS</b> = (264 + 140 + 100) ÷ 3 = 504 ÷ 3 = <b>168 t/s</b> <span class="d">— one request, one vote</span><br>
+      <b>avg duration</b> = (2.1 + 1.8 + 4.0) ÷ 3 = 7.9 ÷ 3 = <b>2.63s → 2.6s</b><br>
+      <b>cache</b> = ΣcacheRead ÷ Σinput = 41,186 ÷ 72,947 = <b>56%</b> <span class="d">— token-weighted, NOT the average of 51/99/40 (= 63%)</span>
+    </div>
+  </div>
+
+  <div class="alert">
+    <span>⚠</span>
+    <div><b>Token-weighted is the honest one.</b> Averaging percentages lets one tiny cold request
+      cancel out one huge warm prompt. 51 / 99 / 40 averages to 63%, but the real number of cached
+      tokens is 41,186 of 72,947 — <b>56%</b>. The mod reports 56%.</div>
+  </div>
+
+  <!-- ================= 4. TOTAL TOKENS ================= -->
+  <h2>4 · total tokens — requests <em>and</em> sub-agents</h2>
+  <div class="panel">
+    <div class="tokbar">
+      <div style="width:78.3%;background:linear-gradient(90deg,#0e7490,#22d3ee);color:#03202a">requests 73,293</div>
+      <div style="width:21.7%;background:linear-gradient(90deg,#7e22ce,#e879f9);color:#1b0325">⑂ 20,370</div>
+    </div>
+    <div class="tokrow"><span>input + output, every request</span><span>sub-agent usage totals</span></div>
+    <div class="formula">
+      <b>total</b> = Σ(input + output) + Σ sub-agent tokens = 73,293 + 20,370 = <b>93,663 → 94k tok</b>
+    </div>
+    <p class="cap">Each sub-agent is its own inference call billed on its own tokens, so it counts toward
+      the total — but its TTFT, TPS and duration stay out of the averages, because those are approximate
+      for a child (next section).</p>
+  </div>
+
+  <!-- ================= 5. WHERE IT SHOWS ================= -->
+  <h2>5 · Where the numbers appear on screen</h2>
+
+  <div class="panel">
+    <div class="screen">
+      <div class="lbl">spinner line — while a request streams</div>
+      <div class="spin">◐ <span class="c">TPS 264</span> · <span class="g">TTFT 1.6s</span> · 2.1s</div>
+      <div class="cap" style="margin-top:10px">live rolling window · dim number = elapsed</div>
+    </div>
+    <div class="screen" style="margin-top:14px">
+      <div class="lbl">spinner line — between requests (last request)</div>
+      <div class="spin">⏱ 2.1s · TTFT 1.6s · 264 t/s · cache 51%</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="screen">
+      <div class="lbl">below-editor widget — new · session averages, always visible</div>
+      <div><span class="d">session</span> <span class="g">TTFT 1.8s</span>
+        <span class="c">168 t/s</span> <span>⏱ 2.6s</span>
+        <span class="y">cache 56%</span> <span class="m">94k tok</span></div>
+      <hr class="boxhr">
+      <div class="prompt">› <span class="cur">█</span></div>
+      <div class="status" style="margin-top:8px">status row · mod segments render here after built-ins</div>
+    </div>
+    <p class="cap">This is the field under the chat box. It reads the same aggregate the
+      <code>/metrics</code> summary prints, so the numbers can never disagree.</p>
+  </div>
+
+  <div class="panel">
+    <div class="screen">
+      <div class="lbl">/metrics pane — full history</div>
+      <div class="d" style="margin-bottom:8px">Requests</div>
+      <div><span class="d">#1</span> deepseek-v4.1-flash <span class="g">TTFT 1.6s</span> ⏱ 2.1s <span class="d">132 tok</span> <span class="y">cache 51%</span> <span class="c">264 t/s</span> <span class="d">end_turn</span></div>
+      <div><span class="d">#2</span> deepseek-v4.1-flash <span class="g">TTFT 1.7s</span> ⏱ 1.8s <span class="d">14 tok</span> <span class="y">cache 99%</span> <span class="c">140 t/s</span> <span class="d">end_turn</span></div>
+      <hr class="boxhr">
+      <div class="d" style="margin-bottom:8px">Sub-agents</div>
+      <div><span class="g">✓</span> <b>⑂general</b> <span class="d">run tests</span> <span class="g">TTFT 1.7s</span> ⏱ 3.9s <span class="d">20k tok</span> <span class="m">9.3k t/s</span> <span class="d">1 tool call</span></div>
+    </div>
+  </div>
+
+  <!-- ================= 6. THE APPROXIMATION ================= -->
+  <h2>6 · The one approximation, stated plainly</h2>
+  <div class="grid2">
+    <div class="panel">
+      <div class="kv"><span>parent request TTFT</span><span class="g">measured</span></div>
+      <div class="kv"><span>parent TPS · duration · cache</span><span class="g">exact</span></div>
+      <div class="kv"><span>total tokens</span><span class="g">exact</span></div>
+    </div>
+    <div class="panel">
+      <div class="kv"><span>sub-agent TTFT</span><span class="y">spawn → first forwarded event</span></div>
+      <div class="kv"><span>sub-agent TPS · duration</span><span class="g">exact</span></div>
+      <div class="kv"><span>child first-token time</span><span class="d">not observable</span></div>
+    </div>
+  </div>
+  <p class="cap" style="margin:-4px 0 0">Command Code's sub-agent translator consumes a child's own
+    <code>text_delta</code> and never re-emits it, and child runs do not receive user mods — so no mod can
+    see a child's true first token. The earliest observable point is the first forwarded
+    <code>subagent_progress</code>. That is why sub-agent timing never enters the session averages.</p>
+
+  <p class="cap" style="margin-top:38px">
+    Files: <code>status-metrics.ts</code> (<code>sessionAverages()</code>, <code>below-editor</code> widget) ·
+    <code>tests/metrics.test.ts</code> (27 tests) · <code>README.md</code>
+  </p>
+
+</div>
+</body>
+</html>

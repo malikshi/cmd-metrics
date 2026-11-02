@@ -11,12 +11,14 @@ const {
 	cachePercent,
 	parseUsageBlock,
 	modelLabel,
+	sessionAverages,
 } = await import('../status-metrics.ts');
 
 function createHarness() {
 	const handlers = new Map<string, Array<(event: any) => void>>();
 	const overrides = new Map<string, (props: any, next?: () => any) => any>();
 	const panes = new Map<string, any>();
+	const widgets: Array<{placement: string; render: () => any[]}> = [];
 	const commands = new Map<string, any>();
 	const notices: string[] = [];
 	let widgetRefreshes = 0;
@@ -54,6 +56,10 @@ function createHarness() {
 			openPane: (id: string) => {
 				(createHarness as any).openedPane = id;
 			},
+			widget: (widget: any) => {
+				widgets.push(widget);
+				return {dispose() {}};
+			},
 			closePane: () => {},
 			notify: (message: string) => notices.push(message),
 			refreshWidgets: () => {},
@@ -87,6 +93,10 @@ function createHarness() {
 			return commands.get(name)!.handler({args: '', ui: cmd.ui, cwd: '/tmp', exec: async () => ({stdout: '', stderr: '', code: 0})});
 		},
 		notices,
+		widget(placement = 'below-editor') {
+			const widget = widgets.find(entry => entry.placement === placement);
+			return widget ? widget.render() : [];
+		},
 		get widgetRefreshes() {
 			return widgetRefreshes;
 		},
@@ -418,4 +428,71 @@ test('a request with no usage reports no cache figure', () => {
 	h.emit('text_delta', {delta: 'x'});
 	h.emit('model_request_end', {usage: {inputTokens: 0, outputTokens: 0, cacheReadTokens: 0}});
 	assert.match(flat(h.pane()), /cache —/);
+});
+
+test('sessionAverages averages TTFT, TPS and duration over requests', () => {
+	const stats = sessionAverages([
+		{ttftMs: 400, tps: 100, durationMs: 1_000, inputTokens: 1_000, outputTokens: 50},
+		{ttftMs: 600, tps: 200, durationMs: 3_000, inputTokens: 3_000, outputTokens: 150},
+	]);
+	assert.equal(stats.avgTtftMs, 500);
+	assert.equal(stats.avgTps, 150);
+	assert.equal(stats.avgDurationMs, 2_000);
+	// Token-weighted cache: 0/4000 read, and total tokens counts input + output.
+	assert.equal(stats.cachePercent, 0);
+	assert.equal(stats.totalTokens, 4_200);
+	assert.equal(stats.requests, 2);
+});
+
+test('sessionAverages includes sub-agent tokens in the total but not the averages', () => {
+	const stats = sessionAverages(
+		[{ttftMs: 400, tps: 100, durationMs: 1_000, inputTokens: 1_000, outputTokens: 50}],
+		[{tokensUsed: 20_000}, {tokens: 5_000}],
+	);
+	assert.equal(stats.avgTtftMs, 400);
+	assert.equal(stats.avgTps, 100);
+	assert.equal(stats.totalTokens, 1_050 + 25_000);
+	assert.equal(stats.subagents, 2);
+});
+
+test('sessionAverages reports no averages for an empty session', () => {
+	const stats = sessionAverages([]);
+	assert.equal(stats.avgTtftMs, undefined);
+	assert.equal(stats.avgTps, undefined);
+	assert.equal(stats.avgDurationMs, undefined);
+	assert.equal(stats.cachePercent, undefined);
+	assert.equal(stats.totalTokens, 0);
+});
+
+test('below-editor widget shows session averages and total tokens', () => {
+	const h = createHarness();
+	assert.deepEqual(h.widget(), []);
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/one'});
+	advance(400);
+	h.emit('text_delta', {delta: 'x'});
+	advance(600);
+	h.emit('model_request_end', {
+		usage: {inputTokens: 1_000, outputTokens: 60, cacheReadTokens: 700},
+	});
+	const text = flat(h.widget());
+	assert.match(text, /TTFT 0\.40s/);
+	assert.match(text, /100 t\/s/);
+	assert.match(text, /⏱ 1\.0s/);
+	assert.match(text, /cache 70%/);
+	assert.match(text, /1\.1k tok/);
+});
+
+test('/metrics summary reports average duration and total tokens', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/one'});
+	advance(400);
+	h.emit('text_delta', {delta: 'x'});
+	advance(600);
+	h.emit('model_request_end', {usage: {inputTokens: 1_000, outputTokens: 60}});
+	const message = h.command().message;
+	assert.match(message, /avg TTFT 0\.40s/);
+	assert.match(message, /avg duration 1\.0s/);
+	assert.match(message, /total 1\.1k tok/);
 });
