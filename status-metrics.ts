@@ -14,6 +14,7 @@ const SPINNER_SUBAGENTS = 3;
 const TOKENS_PER_K = 1_000;
 const TOKENS_PER_M = 1_000_000;
 const PANE_ID = 'metrics';
+const STORE_KEY = 'session';
 
 interface Usage {
 	inputTokens?: number;
@@ -67,6 +68,15 @@ interface RequestMetric {
 interface SubagentMetric {
 	tokens?: number;
 	tokensUsed?: number;
+}
+
+// What cmd.store keeps in ~/.commandcode/mods/.store/status-metrics.json. The sessionId is the
+// whole point: a hot reload and a /reload restart both hand the mod the same session again, so
+// the stored figures are restored instead of a blank line; a different session overwrites them.
+interface PersistedSession {
+	sessionId?: string;
+	requests: RequestRecord[];
+	subagents: SubagentRecord[];
 }
 
 export interface SessionAverages {
@@ -245,6 +255,7 @@ export default function (cmd: ModApi): void {
 	// and shifting the array at 50 would silently turn them into a trailing window. Only the
 	// pane caps what it draws.
 	let history: RequestRecord[] = [];
+	let sessionId: string | undefined;
 	const subagents = new Map<string, SubagentRecord>();
 	let samples: {at: number; tokens: number}[] = [];
 	let smoothed: number | undefined;
@@ -259,6 +270,30 @@ export default function (cmd: ModApi): void {
 	const reset = (): void => {
 		current = undefined;
 		resetRate();
+	};
+
+	// cmd.store is synchronous on read: the host loads the file before the factory runs. The
+	// figures are restored only when the id matches, so resuming an unrelated older session
+	// never adopts someone else's totals.
+	const restore = (id: string | undefined): void => {
+		if (id === undefined) return;
+		const stored = cmd.store.get<PersistedSession>(STORE_KEY);
+		if (!stored || stored.sessionId !== id) return;
+		history = Array.isArray(stored.requests) ? stored.requests : [];
+		subagents.clear();
+		for (const subagent of Array.isArray(stored.subagents) ? stored.subagents : []) {
+			subagents.set(subagent.toolCallId, subagent);
+		}
+	};
+
+	const save = (id: string | undefined): void => {
+		if (id === undefined) return;
+		const snapshot: PersistedSession = {
+			sessionId: id,
+			requests: history,
+			subagents: [...subagents.values()],
+		};
+		void cmd.store.set(STORE_KEY, snapshot);
 	};
 
 	const rateFor = (now: number, tokens: number): number | undefined => {
@@ -363,7 +398,8 @@ export default function (cmd: ModApi): void {
 	};
 
 	const summaryLine = (): string => {
-		if (history.length === 0) return 'metrics: no completed model requests yet';
+		if (history.length === 0 && subagents.size === 0)
+			return 'metrics: no completed model requests yet';
 		const stats = sessionAverages(history, [...subagents.values()]);
 		const parts = [`metrics: ${stats.requests} request(s)`];
 		if (stats.avgTtftMs !== undefined) parts.push(`avg TTFT ${formatDuration(stats.avgTtftMs)}`);
@@ -391,7 +427,19 @@ export default function (cmd: ModApi): void {
 	};
 
 	const avgWidgetLines = (): Line[] => {
-		if (history.length === 0) return [];
+		if (history.length === 0) {
+			// Keep the placement occupied: an empty render would drop the line entirely, which
+			// reads as "the mod stopped working" rather than "no requests yet".
+			return [
+				{
+					type: 'row',
+					children: [
+						{type: 'text', text: 'session', dim: true},
+						{type: 'text', text: 'no requests yet', dim: true},
+					],
+				},
+			];
+		}
 		const stats = sessionAverages(history, [...subagents.values()]);
 		const nodes: TextNode[] = [{type: 'text', text: 'session', dim: true}];
 		if (stats.avgTtftMs !== undefined)
@@ -626,6 +674,7 @@ export default function (cmd: ModApi): void {
 		history.push(record);
 		current = undefined;
 		resetRate();
+		save(sessionId);
 		repaint();
 	});
 
@@ -692,6 +741,7 @@ export default function (cmd: ModApi): void {
 		if (Number.isFinite(tokens) && tokens > 0) subagent.tokensUsed = tokens;
 		if (typeof payload.status === 'string') subagent.status = payload.status;
 		finalizeSubagent(subagent);
+		save(sessionId);
 		repaint();
 	});
 
@@ -716,15 +766,20 @@ export default function (cmd: ModApi): void {
 		if (history.length > 0) cmd.ui.notify(summaryLine());
 	});
 
+	// A hot reload and a /reload restart both arrive as onSessionStart with the SAME sessionId,
+	// so the stored figures are restored rather than wiped: a reload re-runs this factory, which
+	// means the in-memory history is gone and cmd.store is the only source. restore() adopts the
+	// figures only when the stored id matches, so a different or older session starts from zero.
 	cmd.hooks({
-		onSessionStart: () => {
+		onSessionStart: ({sessionId: next}) => {
+			reset();
 			history = [];
 			subagents.clear();
-			reset();
+			sessionId = next;
+			restore(next);
 		},
 		onSessionEnd: () => {
-			history = [];
-			subagents.clear();
+			save(sessionId);
 			reset();
 		},
 	});

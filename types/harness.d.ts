@@ -104,8 +104,14 @@ declare module '@commandcode/harness' {
 		subscribe<T>(key: string, listener: (value: T) => void): {dispose(): void};
 	}
 
+	export interface ModStoreApi {
+		get<T>(key: string): T | undefined;
+		set<T>(key: string, value: T): Promise<void>;
+		delete(key: string): Promise<void>;
+	}
+
 	export interface ModHooks {
-		onSessionStart?(input: {source: string}): void;
+		onSessionStart?(input: {source: string; sessionId?: string}): void;
 		onSessionEnd?(input: {reason: string}): void;
 		onTurnEnd?(input: {
 			state: unknown;
@@ -147,6 +153,7 @@ declare module '@commandcode/harness' {
 		readonly cwd: string;
 		readonly ui: ModUi;
 		readonly state: ModStateApi;
+		readonly store: ModStoreApi;
 		on<K extends AgentEvent['type']>(
 			event: K,
 			handler: (event: Extract<AgentEvent, {type: K}>) => void,

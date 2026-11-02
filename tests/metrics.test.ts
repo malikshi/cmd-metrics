@@ -14,7 +14,7 @@ const {
 	sessionAverages,
 } = await import('../status-metrics.ts');
 
-function createHarness() {
+function createHarness(sharedStore?: Map<string, unknown>) {
 	const handlers = new Map<string, Array<(event: any) => void>>();
 	const overrides = new Map<string, (props: any, next?: () => any) => any>();
 	const panes = new Map<string, any>();
@@ -22,6 +22,10 @@ function createHarness() {
 	const commands = new Map<string, any>();
 	const notices: string[] = [];
 	let widgetRefreshes = 0;
+	// Stands in for ~/.commandcode/mods/.store/status-metrics.json. Passing the same Map to a
+	// second harness is how a test simulates a hot reload or a full restart: the new module
+	// instance starts with empty memory but the same file on disk.
+	const store = sharedStore ?? new Map<string, unknown>();
 
 	const record = (id: string, data: any) => {
 		const history = ((createHarness as any).sessions ??= new Map()).get(id) ?? [];
@@ -74,6 +78,15 @@ function createHarness() {
 				},
 			};
 		})(),
+		store: {
+			get: (key: string) => store.get(key),
+			set: async (key: string, value: unknown) => {
+				store.set(key, value);
+			},
+			delete: async (key: string) => {
+				store.delete(key);
+			},
+		},
 	};
 
 	mod(cmd);
@@ -468,7 +481,7 @@ test('sessionAverages reports no averages for an empty session', () => {
 
 test('below-editor widget shows session averages and total tokens', () => {
 	const h = createHarness();
-	assert.deepEqual(h.widget(), []);
+	assert.match(flat(h.widget()), /no requests yet/);
 	h.emit('run_start');
 	h.emit('model_request_start', {model: 'm/one'});
 	advance(400);
@@ -580,4 +593,85 @@ test('an agent tool result without a usage block does not close the child at zer
 	const text = flat(h.pane());
 	assert.match(text, /▶/);
 	assert.match(text, /⏱ 1\.5s/);
+});
+
+test('an empty session keeps the widget line instead of dropping it', () => {
+	const h = createHarness();
+	assert.match(flat(h.widget()), /session \| no requests yet/);
+});
+
+test('a reload restores the figures from cmd.store for the same session', () => {
+	const store = new Map<string, unknown>();
+	const first = createHarness(store);
+	first.hooks().onSessionStart({source: 'startup', sessionId: 'sess-1'});
+	first.emit('run_start');
+	first.emit('model_request_start', {model: 'm/one'});
+	advance(400);
+	first.emit('text_delta', {delta: 'x'});
+	advance(600);
+	first.emit('model_request_end', {usage: {inputTokens: 1_000, outputTokens: 60}});
+
+	// A hot reload of the same session: the factory runs again with empty memory.
+	first.hooks().onSessionEnd({reason: 'reload'});
+	const reloaded = createHarness(store);
+	reloaded.hooks().onSessionStart({source: 'reload', sessionId: 'sess-1'});
+
+	assert.match(flat(reloaded.widget()), /TTFT 0\.40s/);
+	assert.match(flat(reloaded.widget()), /1\.1k tok/);
+	assert.match(flat(reloaded.pane()), /#1/);
+	assert.match(reloaded.command().message, /1 request/);
+});
+
+test('a /reload restart restores figures because the session id matches', () => {
+	const store = new Map<string, unknown>();
+	const before = createHarness(store);
+	before.hooks().onSessionStart({source: 'startup', sessionId: 'sess-9'});
+	before.emit('run_start');
+	before.emit('model_request_start', {model: 'm/one'});
+	advance(200);
+	before.emit('text_delta', {delta: 'x'});
+	advance(800);
+	before.emit('model_request_end', {usage: {inputTokens: 2_000, outputTokens: 100}});
+
+	// The process restarted: new module instance, same on-disk store, resumed session.
+	const after = createHarness(store);
+	after.hooks().onSessionStart({source: 'startup', sessionId: 'sess-9'});
+
+	assert.match(after.command().message, /1 request/);
+	assert.match(flat(after.widget()), /2\.1k tok/);
+});
+
+test('a different session does not adopt the stored totals', () => {
+	const store = new Map<string, unknown>();
+	const first = createHarness(store);
+	first.hooks().onSessionStart({source: 'startup', sessionId: 'sess-a'});
+	first.emit('run_start');
+	first.emit('model_request_start', {model: 'm/one'});
+	advance(100);
+	first.emit('text_delta', {delta: 'x'});
+	first.emit('model_request_end', {usage: {outputTokens: 5}});
+
+	const second = createHarness(store);
+	second.hooks().onSessionStart({source: 'startup', sessionId: 'sess-b'});
+	assert.match(second.command().message, /no completed model requests yet/);
+	assert.match(flat(second.widget()), /no requests yet/);
+});
+
+test('sub-agents survive a reload with the session', () => {
+	const store = new Map<string, unknown>();
+	const first = createHarness(store);
+	first.hooks().onSessionStart({source: 'startup', sessionId: 'sess-s'});
+	first.emit('run_start');
+	first.emit('subagent_start', {toolCallId: 'c1', subagentType: 'explore', description: 'find'});
+	advance(500);
+	first.emit('subagent_progress', {toolCallId: 'c1', tokensUsed: 1_000});
+	advance(500);
+	first.emit('subagent_stop', {toolCallId: 'c1', tokensUsed: 20_370});
+
+	const reloaded = createHarness(store);
+	reloaded.hooks().onSessionStart({source: 'reload', sessionId: 'sess-s'});
+	const text = flat(reloaded.pane());
+	assert.match(text, /⑂explore/);
+	assert.match(text, /20k tok/);
+	assert.match(reloaded.command().message, /1 sub-agent/);
 });

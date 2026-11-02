@@ -36,6 +36,13 @@ They are **session-wide**: every request of the session is kept, so request 200 
 request 1. The pane draws only the most recent 50 rows (`… N earlier request(s)`), but the
 totals and averages never truncate.
 
+The figures also **survive a reload**. They are written to
+`~/.commandcode/mods/.store/status-metrics.json` on every completed request and sub-agent, and
+restored when a reload or a `/reload` restart hands the mod the same `sessionId` again. A
+different session starts from zero — the stored figures carry their session id, so resuming an
+unrelated older session never adopts another session's totals. Reload a mod in place with
+`/mods reload status-metrics`; `/reload` restarts the process and resumes the session.
+
 A request whose first token was never observed (a cancelled or failed call) reports no TTFT and
 no TPS — `—`, not its duration dressed up as a measurement. It still counts in the request
 total, the token total and the cache rate.
@@ -111,7 +118,7 @@ implying token-level precision. Its duration, token count and TPS are exact.
 ## Development
 
 ```bash
-npm test        # 33 unit tests, no build step (node --experimental-strip-types)
+npm test        # 38 unit tests, no build step (node --experimental-strip-types)
 npm run typecheck
 ```
 
