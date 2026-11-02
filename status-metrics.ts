@@ -14,7 +14,11 @@ const SPINNER_SUBAGENTS = 3;
 const TOKENS_PER_K = 1_000;
 const TOKENS_PER_M = 1_000_000;
 const PANE_ID = 'metrics';
-const STORE_KEY = 'session';
+const SESSION_KEY_PREFIX = 'session:';
+const INDEX_KEY = 'sessions';
+const MAX_PERSISTED_SESSIONS = 20;
+
+const sessionKey = (sessionId: string): string => `${SESSION_KEY_PREFIX}${sessionId}`;
 
 interface Usage {
 	inputTokens?: number;
@@ -272,18 +276,28 @@ export default function (cmd: ModApi): void {
 		resetRate();
 	};
 
-	// cmd.store is synchronous on read: the host loads the file before the factory runs. The
-	// figures are restored only when the id matches, so resuming an unrelated older session
-	// never adopts someone else's totals.
+	// cmd.store is synchronous on read: the host loads the file before the factory runs. Every
+	// session is kept under its own key, so resuming an older session restores its own figures
+	// instead of adopting whichever session happened to be the most recent.
 	const restore = (id: string | undefined): void => {
 		if (id === undefined) return;
-		const stored = cmd.store.get<PersistedSession>(STORE_KEY);
-		if (!stored || stored.sessionId !== id) return;
+		const stored = cmd.store.get<PersistedSession>(sessionKey(id));
+		if (!stored) return;
 		history = Array.isArray(stored.requests) ? stored.requests : [];
 		subagents.clear();
 		for (const subagent of Array.isArray(stored.subagents) ? stored.subagents : []) {
 			subagents.set(subagent.toolCallId, subagent);
 		}
+	};
+
+	// cmd.store.set rewrites the WHOLE store file (read-modify-write, no lock, not atomic), and
+	// the host does not await session hooks, so two unsequenced writes interleave and corrupt
+	// the JSON. A parse failure then makes the host drop every stored session silently. Every
+	// write therefore goes through one promise chain: a save is queued behind the previous one
+	// and the file is only ever rewritten by a single writer at a time.
+	let writes: Promise<void> = Promise.resolve();
+	const enqueueWrite = (write: () => Promise<void>): void => {
+		writes = writes.then(write, write).catch(() => {});
 	};
 
 	const save = (id: string | undefined): void => {
@@ -293,7 +307,16 @@ export default function (cmd: ModApi): void {
 			requests: history,
 			subagents: [...subagents.values()],
 		};
-		void cmd.store.set(STORE_KEY, snapshot);
+		const key = sessionKey(id);
+		enqueueWrite(async () => {
+			const known = cmd.store.get<string[]>(INDEX_KEY);
+			const ordered = [id, ...(Array.isArray(known) ? known.filter(entry => entry !== id) : [])];
+			await cmd.store.set(key, snapshot);
+			await cmd.store.set(INDEX_KEY, ordered.slice(0, MAX_PERSISTED_SESSIONS));
+			for (const evicted of ordered.slice(MAX_PERSISTED_SESSIONS)) {
+				await cmd.store.delete(sessionKey(evicted));
+			}
+		});
 	};
 
 	const rateFor = (now: number, tokens: number): number | undefined => {

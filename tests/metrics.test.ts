@@ -26,6 +26,8 @@ function createHarness(sharedStore?: Map<string, unknown>) {
 	// second harness is how a test simulates a hot reload or a full restart: the new module
 	// instance starts with empty memory but the same file on disk.
 	const store = sharedStore ?? new Map<string, unknown>();
+	let storeInFlight = 0;
+	let storeOverlaps = 0;
 
 	const record = (id: string, data: any) => {
 		const history = ((createHarness as any).sessions ??= new Map()).get(id) ?? [];
@@ -80,11 +82,22 @@ function createHarness(sharedStore?: Map<string, unknown>) {
 		})(),
 		store: {
 			get: (key: string) => store.get(key),
+			// Mirrors the host: each set is a whole-file read-modify-write that yields before it
+			// lands, so overlapping writes would interleave. `storeOverlaps` counts how often a
+			// write started while another was still in flight.
 			set: async (key: string, value: unknown) => {
+				if (storeInFlight > 0) storeOverlaps += 1;
+				storeInFlight += 1;
+				await new Promise(resolve => setTimeout(resolve, 0));
 				store.set(key, value);
+				storeInFlight -= 1;
 			},
 			delete: async (key: string) => {
+				if (storeInFlight > 0) storeOverlaps += 1;
+				storeInFlight += 1;
+				await new Promise(resolve => setTimeout(resolve, 0));
 				store.delete(key);
+				storeInFlight -= 1;
 			},
 		},
 	};
@@ -113,6 +126,9 @@ function createHarness(sharedStore?: Map<string, unknown>) {
 		get widgetRefreshes() {
 			return widgetRefreshes;
 		},
+		get storeOverlaps() {
+			return storeOverlaps;
+		},
 		openedPane: () => (createHarness as any).openedPane,
 		hooks: () => (createHarness as any).hooks,
 		record,
@@ -123,6 +139,14 @@ const flat = (nodes: any[]): string =>
 	nodes
 		.map(node => (node.children ? flat(node.children) : (node.text ?? '')))
 		.join(' | ');
+
+// Saves are queued behind one another and each hop yields, so a test drains the chain by
+// letting every pending microtask and timer callback run before asserting on the store.
+const flushWrites = async (): Promise<void> => {
+	for (let index = 0; index < 10; index += 1) {
+		await new Promise(resolve => setTimeout(resolve, 0));
+	}
+};
 
 let clock = 1_000_000;
 const realNow = Date.now;
@@ -600,7 +624,7 @@ test('an empty session keeps the widget line instead of dropping it', () => {
 	assert.match(flat(h.widget()), /session \| no requests yet/);
 });
 
-test('a reload restores the figures from cmd.store for the same session', () => {
+test('a reload restores the figures from cmd.store for the same session', async () => {
 	const store = new Map<string, unknown>();
 	const first = createHarness(store);
 	first.hooks().onSessionStart({source: 'startup', sessionId: 'sess-1'});
@@ -612,7 +636,9 @@ test('a reload restores the figures from cmd.store for the same session', () => 
 	first.emit('model_request_end', {usage: {inputTokens: 1_000, outputTokens: 60}});
 
 	// A hot reload of the same session: the factory runs again with empty memory.
+	await flushWrites();
 	first.hooks().onSessionEnd({reason: 'reload'});
+	await flushWrites();
 	const reloaded = createHarness(store);
 	reloaded.hooks().onSessionStart({source: 'reload', sessionId: 'sess-1'});
 
@@ -622,7 +648,7 @@ test('a reload restores the figures from cmd.store for the same session', () => 
 	assert.match(reloaded.command().message, /1 request/);
 });
 
-test('a /reload restart restores figures because the session id matches', () => {
+test('a /reload restart restores figures because the session id matches', async () => {
 	const store = new Map<string, unknown>();
 	const before = createHarness(store);
 	before.hooks().onSessionStart({source: 'startup', sessionId: 'sess-9'});
@@ -634,6 +660,7 @@ test('a /reload restart restores figures because the session id matches', () => 
 	before.emit('model_request_end', {usage: {inputTokens: 2_000, outputTokens: 100}});
 
 	// The process restarted: new module instance, same on-disk store, resumed session.
+	await flushWrites();
 	const after = createHarness(store);
 	after.hooks().onSessionStart({source: 'startup', sessionId: 'sess-9'});
 
@@ -657,7 +684,82 @@ test('a different session does not adopt the stored totals', () => {
 	assert.match(flat(second.widget()), /no requests yet/);
 });
 
-test('sub-agents survive a reload with the session', () => {
+test('resuming an older session restores that session, not the latest one', async () => {
+	const store = new Map<string, unknown>();
+
+	const older = createHarness(store);
+	older.hooks().onSessionStart({source: 'startup', sessionId: 'sess-old'});
+	older.emit('run_start');
+	older.emit('model_request_start', {model: 'm/old'});
+	advance(100);
+	older.emit('text_delta', {delta: 'x'});
+	older.emit('model_request_end', {usage: {inputTokens: 1_000, outputTokens: 10}});
+
+	const newer = createHarness(store);
+	newer.hooks().onSessionStart({source: 'startup', sessionId: 'sess-new'});
+	newer.emit('run_start');
+	newer.emit('model_request_start', {model: 'm/new'});
+	advance(100);
+	newer.emit('text_delta', {delta: 'x'});
+	newer.emit('model_request_end', {usage: {inputTokens: 5_000, outputTokens: 90}});
+	newer.emit('model_request_start', {model: 'm/new'});
+	advance(100);
+	newer.emit('text_delta', {delta: 'x'});
+	newer.emit('model_request_end', {usage: {inputTokens: 5_000, outputTokens: 90}});
+
+	// Resuming the OLDER session must bring back its single request, not the newer two.
+	await flushWrites();
+	const resumed = createHarness(store);
+	resumed.hooks().onSessionStart({source: 'startup', sessionId: 'sess-old'});
+	assert.match(resumed.command().message, /1 request/);
+	assert.match(flat(resumed.pane()), /old/);
+	assert.doesNotMatch(flat(resumed.pane()), /new/);
+});
+
+test('the stored session index drops the oldest entries rather than growing forever', async () => {
+	const store = new Map<string, unknown>();
+	for (let index = 0; index < 25; index += 1) {
+		const h = createHarness(store);
+		h.hooks().onSessionStart({source: 'startup', sessionId: `sess-${index}`});
+		h.emit('run_start');
+		h.emit('model_request_start', {model: 'm/one'});
+		advance(100);
+		h.emit('text_delta', {delta: 'x'});
+		h.emit('model_request_end', {usage: {outputTokens: 5}});
+		await flushWrites();
+	}
+
+	const index: string[] = store.get('sessions') as string[];
+	assert.equal(index.length, 20);
+	assert.equal(index[0], 'sess-24');
+	// The evicted ones are gone from the file, not merely unlisted.
+	assert.equal(store.has('session:sess-0'), false);
+	assert.equal(store.has('session:sess-24'), true);
+});
+
+test('store writes never overlap, because the host rewrites the whole file', async () => {
+	const store = new Map<string, unknown>();
+	const h = createHarness(store);
+	h.hooks().onSessionStart({source: 'startup', sessionId: 'sess-c'});
+
+	// Several saves in the same tick, exactly how a burst of requests would land.
+	h.emit('run_start');
+	for (let index = 0; index < 5; index += 1) {
+		h.emit('model_request_start', {model: 'm/one'});
+		advance(100);
+		h.emit('text_delta', {delta: 'x'});
+		h.emit('model_request_end', {usage: {outputTokens: 5}});
+		h.emit('subagent_start', {toolCallId: `c${index}`, subagentType: 'general', description: 'd'});
+		h.emit('subagent_stop', {toolCallId: `c${index}`, tokensUsed: 5});
+	}
+	await flushWrites();
+
+	assert.equal(h.storeOverlaps, 0);
+	// And the last write wins with the full history, not a torn one.
+	assert.equal((store.get('session:sess-c') as any).requests.length, 5);
+});
+
+test('sub-agents survive a reload with the session', async () => {
 	const store = new Map<string, unknown>();
 	const first = createHarness(store);
 	first.hooks().onSessionStart({source: 'startup', sessionId: 'sess-s'});
@@ -668,6 +770,7 @@ test('sub-agents survive a reload with the session', () => {
 	advance(500);
 	first.emit('subagent_stop', {toolCallId: 'c1', tokensUsed: 20_370});
 
+	await flushWrites();
 	const reloaded = createHarness(store);
 	reloaded.hooks().onSessionStart({source: 'reload', sessionId: 'sess-s'});
 	const text = flat(reloaded.pane());

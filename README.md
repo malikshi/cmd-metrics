@@ -38,10 +38,19 @@ totals and averages never truncate.
 
 The figures also **survive a reload**. They are written to
 `~/.commandcode/mods/.store/status-metrics.json` on every completed request and sub-agent, and
-restored when a reload or a `/reload` restart hands the mod the same `sessionId` again. A
-different session starts from zero — the stored figures carry their session id, so resuming an
-unrelated older session never adopts another session's totals. Reload a mod in place with
-`/mods reload status-metrics`; `/reload` restarts the process and resumes the session.
+restored when a reload or a `/reload` restart hands the mod the same `sessionId` again.
+
+Each session is stored under its own key (`session:<id>`), so resuming an older session brings
+back that session's figures rather than the most recent ones. A new session starts from zero and
+never inherits another's totals. The most recently written 20 sessions are kept; older entries
+are deleted from the file rather than accumulating.
+
+Writes are serialized through a single promise chain, because `cmd.store.set` rewrites the whole
+file with no lock — two overlapping writes would corrupt the JSON, and a parse failure makes the
+host drop every stored session silently.
+
+Reload a mod in place with `/mods reload status-metrics`; `/reload` restarts the process and
+resumes the session.
 
 A request whose first token was never observed (a cancelled or failed call) reports no TTFT and
 no TPS — `—`, not its duration dressed up as a measurement. It still counts in the request
@@ -118,7 +127,7 @@ implying token-level precision. Its duration, token count and TPS are exact.
 ## Development
 
 ```bash
-npm test        # 38 unit tests, no build step (node --experimental-strip-types)
+npm test        # 41 unit tests, no build step (node --experimental-strip-types)
 npm run typecheck
 ```
 
