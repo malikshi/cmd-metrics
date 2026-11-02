@@ -180,19 +180,22 @@ agent:   claude-sonnet-4 | anthropic | 2026-11-02 | code-review | removed sectio
       cancel out one huge warm prompt. 51 / 99 / 40 averages to 63%, but the real number of cached
       tokens is 41,186 of 72,947 — <b>56%</b>. The mod reports 56%.</div>
   </div>
-  <h2>4 · total tokens — requests <em>and</em> sub-agents</h2>
+  <h2>4 · total tokens — two lines, two totals</h2>
   <div class="panel">
     <div class="tokbar">
-      <div style="width:78.3%;background:linear-gradient(90deg,#0e7490,#22d3ee);color:#03202a">requests 73,293</div>
+      <div style="width:78.3%;background:linear-gradient(90deg,#0e7490,#22d3ee);color:#03202a">session 73,293</div>
       <div style="width:21.7%;background:linear-gradient(90deg,#7e22ce,#e879f9);color:#1b0325">⑂ 20,370</div>
     </div>
-    <div class="tokrow"><span>input + output, every request</span><span>sub-agent usage totals</span></div>
+    <div class="tokrow"><span>input + output, every parent request</span><span>sub-agent usage totals</span></div>
     <div class="formula">
-      <b>total</b> = Σ(input + output) + Σ sub-agent tokens = 73,293 + 20,370 = <b>93,663 → 94k tok</b>
+      <b>session tok</b> = Σ(parent input + output) = <b>73,293 → 73k tok</b><br>
+      <b>⑂ tok</b> = Σ sub-agent tokens = <b>20,370 → 20k tok</b><br>
+      <b>whole session</b> = 73,293 + 20,370 = <b>93,663 → 94k tok</b> <span class="d">— the reader adds the two</span>
     </div>
-    <p class="cap">Each sub-agent is its own inference call billed on its own tokens, so it counts toward
-      the total — but its TTFT, TPS and duration stay out of the averages, because those are approximate
-      for a child (next section).</p>
+    <p class="cap">Each sub-agent is its own inference call billed on its own tokens, so it is reported —
+      on its own line. The session row counts parent requests only, so no parent figure has a child's
+      usage inside it. Both figures are totals, never a mean-per-child: ⑂2 at 6.2M means 6.2M tokens
+      across both children, not 12.4M.</p>
   </div>
   <h2>5 · Where the numbers appear on screen</h2>
 
@@ -213,10 +216,10 @@ agent:   claude-sonnet-4 | anthropic | 2026-11-02 | code-review | removed sectio
       <div class="lbl">below-editor widget — new · session averages, always visible</div>
       <div><span class="d">session</span> <span class="g">TTFT 1.8s</span>
         <span class="c">168 t/s</span> <span>⏱ 2.6s</span>
-        <span class="y">cache 56%</span> <span class="m">94k tok</span></div>
+        <span class="y">cache 56%</span> <span class="m">73k tok</span></div>
       <div style="margin-top:2px"><span class="m">⑂3</span>
         <span class="g">TTFT 2.6s</span> <span class="m">9.4k t/s</span>
-        <span>⏱ 41s</span> <span class="d">20k tok avg</span></div>
+        <span>⏱ 41s</span> <span class="m">20k tok</span></div>
       <hr class="boxhr">
       <div class="prompt">› <span class="cur">█</span></div>
       <div class="status" style="margin-top:8px">status row · mod segments render here after built-ins</div>

@@ -18,7 +18,7 @@ so the per-request numbers on the spinner never hide the trend:
 
 ```
 session TTFT 1.8s  87 t/s  ⏱ 3.4s  cache 51%  42k tok
-⑂3 TTFT 2.6s  9.4k t/s  ⏱ 41s  20k tok avg
+⑂3 TTFT 2.6s  9.4k t/s  ⏱ 41s  20k tok
 ```
 
 | Field | Meaning |
@@ -27,10 +27,10 @@ session TTFT 1.8s  87 t/s  ⏱ 3.4s  cache 51%  42k tok
 | **t/s** | Mean generated tokens per second, each request weighted equally. |
 | **⏱** | Mean wall time of a model request. |
 | **cache** | Token-weighted `ΣcacheRead ÷ Σinput` for the session. |
-| **tok** | Total tokens this session — input + output for every request, plus every sub-agent's tokens. |
+| **tok** | Total tokens for the session's model requests only: input + output. |
 
 The second line appears once the session has spawned a sub-agent. It averages the same fields
-over the stored child records, plus each child's token total:
+over the stored child records, and sums each child's tokens:
 
 | Field | Meaning |
 |---|---|
@@ -38,14 +38,14 @@ over the stored child records, plus each child's token total:
 | **TTFT** | Mean spawn → first forwarded child event. Approximate, so it gets its own line instead of being folded into the parent average. |
 | **t/s** | Mean child `tokens ÷ (duration − TTFT)`. |
 | **⏱** | Mean child wall time, from the `<usage>` block when the tool result carries one. |
-| **tok avg** | Mean tokens per child. |
+| **tok** | Total tokens every sub-agent consumed. |
 
 Sub-agent **cache** has no figure: a child carries no prompt accounting, so there is nothing to
 divide.
 
-The parent averages stay request-only on purpose: a sub-agent's TTFT is approximate, so it is not
-mixed into a measured one. Its tokens still count toward the total, because each child is its
-own inference call. `/metrics` repeats the same figures as a one-line summary.
+The two lines never mix. The parent row holds measured request figures and request tokens; the
+child row holds approximate child figures and child tokens. Read the session's whole cost as the
+sum of the two `tok` figures — each is already a total, so a mean-per-child is never shown.
 
 They are **session-wide**: every request of the session is kept, so request 200 still includes
 request 1. The pane draws only the most recent 50 rows (`… N earlier request(s)`), but the

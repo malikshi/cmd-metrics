@@ -480,14 +480,15 @@ test('sessionAverages averages TTFT, TPS and duration over requests', () => {
 	assert.equal(stats.requests, 2);
 });
 
-test('sessionAverages includes sub-agent tokens in the total but not the averages', () => {
+test('sessionAverages keeps sub-agent tokens out of the parent total', () => {
 	const stats = sessionAverages(
 		[{ttftMs: 400, tps: 100, durationMs: 1_000, inputTokens: 1_000, outputTokens: 50}],
 		[{tokensUsed: 20_000}, {tokens: 5_000}],
 	);
 	assert.equal(stats.avgTtftMs, 400);
 	assert.equal(stats.avgTps, 100);
-	assert.equal(stats.totalTokens, 1_050 + 25_000);
+	assert.equal(stats.totalTokens, 1_050);
+	assert.equal(stats.subagentTotalTokens, 25_000);
 	assert.equal(stats.subagents, 2);
 });
 
@@ -498,6 +499,7 @@ test('sessionAverages reports no averages for an empty session', () => {
 	assert.equal(stats.avgDurationMs, undefined);
 	assert.equal(stats.cachePercent, undefined);
 	assert.equal(stats.totalTokens, 0);
+	assert.equal(stats.subagentTotalTokens, 0);
 });
 
 test('sessionAverages reports sub-agent averages in their own fields', () => {
@@ -511,7 +513,7 @@ test('sessionAverages reports sub-agent averages in their own fields', () => {
 	assert.equal(stats.subagentAvgTtftMs, 1_000);
 	assert.equal(stats.subagentAvgTps, 300);
 	assert.equal(stats.subagentAvgDurationMs, 3_000);
-	assert.equal(stats.subagentAvgTokens, 2_000);
+	assert.equal(stats.subagentTotalTokens, 4_000);
 	assert.equal(stats.subagentToolCalls, 3);
 	// The parent averages are untouched by the children.
 	assert.equal(stats.avgTtftMs, 400);
@@ -525,8 +527,8 @@ test('sub-agent averages skip records that never produced a figure', () => {
 	assert.equal(stats.subagentAvgDurationMs, 2_000);
 	assert.equal(stats.subagentAvgTtftMs, undefined);
 	assert.equal(stats.subagentAvgTps, undefined);
-	// tokensUsed wins over the running count.
-	assert.equal(stats.subagentAvgTokens, 1_500);
+	// Every child's own token count still sums into the child total.
+	assert.equal(stats.subagentTotalTokens, 2_000);
 });
 
 test('sub-agent averages survive a reload, since the records are stored', async () => {
@@ -546,7 +548,7 @@ test('sub-agent averages survive a reload, since the records are stored', async 
 	const text = flat(reloaded.widget());
 	assert.match(text, /⑂1/);
 	assert.match(text, /TTFT 0\.50s/);
-	assert.match(text, /20k tok avg/);
+	assert.match(text, /20k tok/);
 });
 
 test('the widget gives sub-agent averages their own line', () => {
@@ -568,6 +570,9 @@ test('the widget gives sub-agent averages their own line', () => {
 	// Parent row stays measured; the child row is separate and labelled.
 	assert.match(flat([lines[0]]), /^session \| TTFT/);
 	assert.match(flat([lines[1]]), /⑂1 \| TTFT 0\.30s \| /);
+	// The parent token total is requests only — the child's 900 must not appear in it.
+	assert.match(flat([lines[0]]), /1\.1k tok/);
+	assert.match(flat([lines[1]]), /900 tok/);
 });
 
 test('below-editor widget shows session averages and total tokens', () => {

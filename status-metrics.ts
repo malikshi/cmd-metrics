@@ -2,7 +2,8 @@
 //
 // exports: default | SessionAverages | tpsText | formatDuration | formatTokens | formatRate | formatPercent | cachePercent | parseUsageBlock | modelLabel | sessionAverages
 // used_by: tests/metrics.test.ts → formatters, sessionAverages, parseUsageBlock, modelLabel, default
-// rules:   Every figure comes from the public mod API; no Command Code internals are patched. A request with no observed first token reports no TTFT and no TPS. Store writes are serialized through one chain.
+// rules:   Every figure comes from the public mod API; no Command Code internals are patched. A request with no observed first token reports no TTFT and no TPS. Store writes are serialized through one chain. Each rendered line owns its own token total: parent tokens never include a child's.
+// agent:   claude-sonnet-4 | anthropic | 2026-11-02 | code-review | split the token totals per line so no parent figure mixes in sub-agent usage
 // agent:   claude-sonnet-4 | anthropic | 2026-11-02 | code-review | fixed k/M and percent boundary rounding, clamped the session cache rate, cleared phantom live state on run_end, hardened restore against malformed rows, surfaced store write failures, and completed CodeDNA headers
 
 import type {ModApi} from '@commandcode/harness';
@@ -96,13 +97,15 @@ export interface SessionAverages {
 	avgTps?: number;
 	avgDurationMs?: number;
 	cachePercent?: number;
+	// Parent requests only. A child is its own inference call with its own usage, so its tokens
+	// are reported on the sub-agent line instead of inflating this one.
 	totalTokens: number;
+	subagentTotalTokens: number;
 	// Kept as their own block rather than folded into the parent averages above: a child's
 	// TTFT is spawn → first forwarded event, which is not comparable with a measured one.
 	subagentAvgTtftMs?: number;
 	subagentAvgTps?: number;
 	subagentAvgDurationMs?: number;
-	subagentAvgTokens?: number;
 	subagentToolCalls?: number;
 }
 
@@ -194,7 +197,7 @@ const averageOf = (values: number[]): number | undefined =>
 	values.length === 0 ? undefined : values.reduce((sum, value) => sum + value, 0) / values.length;
 
 // Session aggregates for the widget, the pane and the /metrics summary.
-// Rules:   TTFT, TPS, duration and cache average parent requests only; the approximate child TTFT never dilutes them. Cache is token-weighted and clamped at 100. totalTokens sums parent and child usage.
+// Rules:   every field is computed over one population only — parent requests for TTFT/TPS/duration/cache/totalTokens, children for the subagent fields. A child token never enters a parent figure. Cache is token-weighted and clamped at 100.
 export function sessionAverages(
 	requests: RequestMetric[],
 	subagents: SubagentMetric[] = [],
@@ -212,7 +215,8 @@ export function sessionAverages(
 	const averages: SessionAverages = {
 		requests: requests.length,
 		subagents: subagents.length,
-		totalTokens: requestTokens + subagentTokens,
+		totalTokens: requestTokens,
+		subagentTotalTokens: subagentTokens,
 	};
 	const avgTtftMs = averageOf(
 		requests.map(record => record.ttftMs).filter((ttft): ttft is number => ttft !== undefined),
@@ -239,8 +243,6 @@ export function sessionAverages(
 	if (subagentTps !== undefined) averages.subagentAvgTps = subagentTps;
 	const subagentDuration = averageOf(definedOnly(subagents.map(subagent => subagent.durationMs)));
 	if (subagentDuration !== undefined) averages.subagentAvgDurationMs = subagentDuration;
-	const perSubagentTokens = definedOnly(subagents.map(subagent => subagent.tokensUsed));
-	if (perSubagentTokens.length > 0) averages.subagentAvgTokens = averageOf(perSubagentTokens);
 	const perSubagentToolCalls = definedOnly(subagents.map(subagent => subagent.toolCalls));
 	if (perSubagentToolCalls.length > 0)
 		averages.subagentToolCalls = averageOf(perSubagentToolCalls);
@@ -495,6 +497,7 @@ export default function (cmd: ModApi): void {
 				subagentPart += ` avg ${formatRate(stats.subagentAvgTps)}`;
 			if (stats.subagentAvgDurationMs !== undefined)
 				subagentPart += ` avg ${formatDuration(stats.subagentAvgDurationMs)}`;
+			subagentPart += ` · ${formatTokens(stats.subagentTotalTokens)} tok`;
 			if (stats.subagentToolCalls !== undefined)
 				subagentPart += ` · ${Math.round(stats.subagentToolCalls)} tool call(s) each`;
 			parts.push(subagentPart);
@@ -553,12 +556,11 @@ export default function (cmd: ModApi): void {
 					text: `⏱ ${formatDuration(stats.subagentAvgDurationMs)}`,
 					color: 'white',
 				});
-			if (stats.subagentAvgTokens !== undefined)
-				childNodes.push({
-					type: 'text',
-					text: `${formatTokens(stats.subagentAvgTokens)} tok avg`,
-					dim: true,
-				});
+			childNodes.push({
+				type: 'text',
+				text: `${formatTokens(stats.subagentTotalTokens)} tok`,
+				color: 'magenta',
+			});
 			lines.push({type: 'row', children: childNodes});
 		}
 		return lines;
