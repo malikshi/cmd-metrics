@@ -4,6 +4,7 @@
 // used_by: none
 // rules:   Date.now is frozen to a controllable clock; a harness sharing one store Map simulates a reload or restart. Assertions check rendered text, never internal state.
 // agent:   claude-sonnet-4 | anthropic | 2026-11-02 | code-review | added boundary and resilience regressions, dropped dead helpers, added the L1 header
+// agent:   unknown | anthropic | 2026-11-02 | goal-review | added regressions for the errored agent tool, orphan closing, the session-switch write race and malformed restored rows
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -37,7 +38,7 @@ function createHarness(
 	let storeOverlaps = 0;
 	// Per-harness, so one test's pane open cannot leak into the next.
 	let openedPane: string | undefined;
-	// Every value handed to set(), so a test can check what a queued write actually captured.
+	// Rules: every value handed to set(), so a test can check what a write captured.
 	const writes: Array<{key: string; value: any}> = [];
 
 	const cmd: any = {
@@ -256,7 +257,7 @@ test('a flush-at-end route reports a wall-clock rate, not a fantasy one', () => 
 	h.emit('text_delta', {delta: 'whole answer'});
 	h.emit('text_delta', {delta: ' more'});
 	advance(3);
-	// 500 tokens landed 3 ms after the only text: dividing by that span would report ~167k t/s.
+	// Rules: 500 tokens landed 3 ms after the only text, so decoding by that span reads ~167k t/s.
 	h.emit('model_request_end', {usage: {outputTokens: 500}, stopReason: 'end_turn'});
 
 	const text = flat(h.pane());
@@ -272,7 +273,7 @@ test('a flush 200ms before the end is still caught by the rate, not by shape', (
 	h.emit('text_delta', {delta: 'a'});
 	h.emit('text_delta', {delta: 'b'});
 	advance(200);
-	// A 200 ms generation span for 500 tokens implies 2.5k t/s — impossible, so wall clock wins.
+	// Rules: 500 tokens over a 200 ms span implies 2.5k t/s, which is impossible.
 	h.emit('model_request_end', {usage: {outputTokens: 500}, stopReason: 'end_turn'});
 
 	const text = flat(h.pane());
@@ -289,9 +290,8 @@ test('a thinking chunk before a flushed answer stays bounded, never k-scale', ()
 	advance(900);
 	h.emit('text_delta', {delta: 'the whole answer'});
 	advance(5);
-	// Reasoning is billed as output, so the span from the thinking token is a real timeline and
-	// 400 tokens over 905 ms is a plausible 442 t/s. What must never happen is a k-scale figure
-	// from dividing by the 5 ms transport tail.
+	// Rules: reasoning is billed as output, so the span from the thinking token is a real timeline;
+	// 400 tokens over 905 ms is a plausible 442 t/s. A k-scale figure from the 5 ms tail is not.
 	h.emit('model_request_end', {usage: {outputTokens: 400}, stopReason: 'end_turn'});
 
 	const text = flat(h.pane());
@@ -308,7 +308,7 @@ test('a short genuine stream keeps its measured rate instead of being downgraded
 	advance(200);
 	h.emit('text_delta', {delta: ' Anything else?'});
 	advance(20);
-	// 6 tokens over a 220 ms generation span is a plausible 27 t/s: no downgrade, no `~`.
+	// Rules: 6 tokens over 220 ms is a plausible 27 t/s, so there is no downgrade and no `~`.
 	h.emit('model_request_end', {usage: {outputTokens: 6}, stopReason: 'end_turn'});
 
 	const text = flat(h.pane());
@@ -322,7 +322,7 @@ test('an absurd wall-clock rate is dropped rather than published', () => {
 	h.emit('model_request_start', {model: 'm/instant'});
 	h.emit('text_delta', {delta: 'x'});
 	advance(5);
-	// Even wall clock cannot make 500 tokens in 5 ms real; the row reports no rate at all.
+	// Rules: 500 tokens in 5 ms is not real even by wall clock, so the row reports no rate.
 	h.emit('model_request_end', {usage: {outputTokens: 500}, stopReason: 'end_turn'});
 
 	// The header mentions t/s, so assert on a rendered rate, not on the word.
@@ -1106,7 +1106,7 @@ test('a later run_start does not rewind an established session', () => {
 		requests: [{model: 'm/other', startedAt: 0, outputTokens: 5}],
 		subagents: [],
 	});
-	// The other session has figures of its own, so adopting its id would visibly replace ours.
+	// Rules: the other session has figures, so adopting its id would visibly replace ours.
 	store.set('session:sess-other', {
 		sessionId: 'sess-other',
 		requests: [{model: 'm/stolen', startedAt: 0, outputTokens: 999}],
@@ -1119,7 +1119,7 @@ test('a later run_start does not rewind an established session', () => {
 	advance(100);
 	h.emit('text_delta', {delta: 'x'});
 	h.emit('model_request_end', {usage: {outputTokens: 5}});
-	// A nested run arriving with another id must not swap the session out from under us.
+	// Rules: a nested run with another id must not swap the session out from under us.
 	h.emit('run_start', {sessionId: 'sess-other'});
 
 	assert.match(h.command().message, /2 request/);
@@ -1142,7 +1142,7 @@ test('a stored session keeps its id when a later run_start names another one', (
 	advance(100);
 	h.emit('text_delta', {delta: 'x'});
 	h.emit('model_request_end', {usage: {outputTokens: 5}});
-	// A nested run arriving with another id must not swap the session out from under us.
+	// Rules: a nested run with another id must not swap the session out from under us.
 	h.emit('run_start', {sessionId: 'sess-other'});
 
 	// Nothing may be written under the other session's key.
@@ -1274,4 +1274,191 @@ test('a malformed stored session does not crash the restore', () => {
 	assert.match(h.command().message, /request/);
 	assert.match(text, /⑂agent/);
 	assert.match(text, /0 tool call/);
+});
+
+test('an agent tool that errored still closes its sub-agent row', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('subagent_start', {toolCallId: 'c1', subagentType: 'explore', description: 'find'});
+	advance(2_000);
+	// Rules: the bundle emits tool_errored on a child failure, and the usage block rides either path.
+	h.emit('tool_errored', {toolCallId: 'c1', toolName: 'agent', error: 'sub-agent failed'});
+	h.emit('run_end', {});
+
+	// Rules:   without a usage block the child is closed by run_end, never left running forever.
+	assert.doesNotMatch(flat(h.pane()), /▶/);
+});
+
+test('an errored agent tool result with a usage block still refines the row', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('subagent_start', {toolCallId: 'c2', subagentType: 'general', description: 'work'});
+	advance(300);
+	h.emit('tool_errored', {
+		toolCallId: 'c2',
+		toolName: 'agent',
+		error: '<usage>total_tokens: 2000\ntool_uses: 1\nturns: 1\nduration_ms: 1500</usage>',
+	});
+
+	const text = flat(h.pane());
+	assert.match(text, /⏱ 1\.5s/);
+	assert.match(text, /2\.0k tok/);
+});
+
+test('a finished run closes the sub-agents it leaves open', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('subagent_start', {toolCallId: 'c1', subagentType: 'explore', description: 'find'});
+	advance(500);
+	h.emit('subagent_progress', {toolCallId: 'c1', tokensUsed: 1_000});
+	advance(1_500);
+	// A child that never got its stop event would otherwise render as running forever, and
+	// persist that way until the next reload.
+	h.emit('run_end', {});
+
+	const text = flat(h.pane());
+	assert.doesNotMatch(text, /▶/);
+	assert.match(text, /interrupted/);
+});
+
+test('a background sub-agent is not closed by the end of the run that spawned it', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('subagent_start', {
+		toolCallId: 'bg1',
+		subagentType: 'general',
+		description: 'bg',
+		background: true,
+	});
+	advance(400);
+	h.emit('subagent_progress', {toolCallId: 'bg1', tokensUsed: 100});
+	h.emit('run_end', {});
+
+	// Rules:   a background child outlives its spawning run, so it stays running until it stops.
+	assert.match(flat(h.pane()), /▶/);
+	assert.doesNotMatch(flat(h.pane()), /interrupted/);
+});
+
+test('a malformed stored sub-agent row cannot publish a NaN rate', () => {
+	const store = new Map<string, unknown>();
+	store.set('session:sess-nan', {
+		requests: [],
+		// Every timing field is the wrong type, which is what a hand-edited file looks like.
+		subagents: [
+			{toolCallId: 'c1', startedAt: 'soon', ttftMs: 'later', durationMs: null, tokens: 'many'},
+		],
+	});
+	const h = createHarness(store);
+	h.hooks().onSessionStart({source: 'reload', sessionId: 'sess-nan'});
+
+	const text = flat(h.pane());
+	assert.match(text, /⑂agent/);
+	assert.doesNotMatch(text, /NaN/);
+	assert.doesNotMatch(text, /undefined/);
+});
+
+test('a malformed stored request row cannot poison the session totals', () => {
+	const store = new Map<string, unknown>();
+	store.set('session:sess-bad-req', {
+		// A row whose numbers are strings is what a hand-edited or older file looks like.
+		requests: [
+			{
+				model: 'm/one',
+				startedAt: 0,
+				inputTokens: 'many',
+				outputTokens: 'lots',
+				tps: 'fast',
+				durationMs: 'slow',
+			},
+		],
+		subagents: [],
+	});
+	const h = createHarness(store);
+	h.hooks().onSessionStart({source: 'reload', sessionId: 'sess-bad-req'});
+
+	// Rules:   a string reaching the arithmetic renders as "0many5" or a null average, so every
+	// numeric field is type-checked at the restore boundary instead of trusted.
+	const message = h.command().message;
+	assert.doesNotMatch(message, /NaN|many|lots|fast|null/);
+	// The row survives, with the bad figures dropped instead of concatenated into the text.
+	assert.match(flat(h.pane()), /#1 \| one/);
+	assert.match(flat(h.pane()), /0 tok/);
+});
+
+test('a session switch in one tick files each session under its own key', async () => {
+	const store = new Map<string, unknown>();
+	const h = createHarness(store);
+	h.hooks().onSessionStart({source: 'startup', sessionId: 'sess-old'});
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/old'});
+	advance(100);
+	h.emit('text_delta', {delta: 'x'});
+	h.emit('model_request_end', {usage: {inputTokens: 1_000, outputTokens: 7}});
+
+	// Rules: the host switches sessions without awaiting, so the old write drains after the reset.
+	h.hooks().onSessionEnd({reason: 'replaced'});
+	h.hooks().onSessionStart({source: 'startup', sessionId: 'sess-new'});
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/new'});
+	advance(100);
+	h.emit('text_delta', {delta: 'y'});
+	h.emit('model_request_end', {usage: {inputTokens: 2_000, outputTokens: 9}});
+	await flushWrites();
+
+	assert.equal((store.get('session:sess-old') as any)?.requests.length, 1);
+	assert.equal((store.get('session:sess-old') as any)?.requests[0].model, 'm/old');
+	assert.equal((store.get('session:sess-new') as any)?.requests.length, 1);
+	assert.equal((store.get('session:sess-new') as any)?.requests[0].model, 'm/new');
+});
+
+test('a pending write for one session does not swallow the next session save', async () => {
+	const store = new Map<string, unknown>();
+	const h = createHarness(store);
+	h.hooks().onSessionStart({source: 'startup', sessionId: 'sess-a'});
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/a'});
+	advance(100);
+	h.emit('text_delta', {delta: 'x'});
+	// The write for sess-a is still queued when the next session starts: coalescing is per
+	// session, so it must not suppress sess-b's save.
+	h.emit('model_request_end', {usage: {outputTokens: 5}});
+	h.hooks().onSessionStart({source: 'startup', sessionId: 'sess-b'});
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/b'});
+	advance(100);
+	h.emit('text_delta', {delta: 'x'});
+	h.emit('model_request_end', {usage: {outputTokens: 5}});
+	await flushWrites();
+
+	assert.equal(store.has('session:sess-a'), true);
+	assert.equal(store.has('session:sess-b'), true);
+});
+
+test('a stored rate above the cap is demoted to a wall-clock rate on restore', () => {
+	const store = new Map<string, unknown>();
+	// Rules: an older build stored tps as outputTokens ÷ 1 ms, so 1000× the real figure.
+	store.set('session:sess-legacy', {
+		requests: [
+			{model: 'm/old', startedAt: 0, durationMs: 6_240, ttftMs: 6_239, outputTokens: 175, tps: 175_000},
+			{model: 'm/old', startedAt: 0, durationMs: 1_000, ttftMs: 400, outputTokens: 100, tps: 166},
+		],
+		subagents: [],
+	});
+	const h = createHarness(store);
+	h.hooks().onSessionStart({source: 'reload', sessionId: 'sess-legacy'});
+
+	// Rules: the bogus figure is dropped, never republished as `~175k t/s` or averaged in.
+	const message = h.command().message;
+	assert.match(message, /avg 166 t\/s/);
+	assert.doesNotMatch(message, /wall-clock/);
+	const row = flat(h.pane());
+	assert.doesNotMatch(row, /175k t\/s/);
+	assert.match(row, /#1 \| old \| TTFT 6\.2s \| ⏱ 6\.2s \| 175 tok \| cache — \| —/);
+});
+
+test('a request with no rate is not reported as a wall-clock rate', () => {
+	// Rules: a request with no rate is not a measured figure, so it is not an excluded one either.
+	const stats = sessionAverages([{durationMs: 2_000}]);
+	assert.equal(stats.wallClockRequests, undefined);
+	assert.equal(sessionAverages([{tps: 50, wallClockRate: true}]).wallClockRequests, 1);
 });

@@ -5,6 +5,7 @@
 // related: tsconfig.json includes this file so tsc checks the mod against the real surface.
 // rules:   mirror only what the mod uses; never invent a field the CLI does not provide.
 // agent:   claude-sonnet-4 | anthropic | 2026-11-02 | code-review | added the L1 header
+// agent:   unknown | anthropic | 2026-11-02 | goal-review | added subagent_stop status and the tool_errored toolName the mod reads
 declare module '@commandcode/harness' {
 	export interface ModContext {
 		emit(event: {type: string}): void;
@@ -36,7 +37,7 @@ declare module '@commandcode/harness' {
 		| {type: 'tool_queued'; toolCallId: string; toolName: string; input: unknown}
 		| {type: 'tool_running'; toolCallId: string; toolName: string; description: string}
 		| {type: 'tool_completed'; toolCallId?: string; toolName?: string; result: unknown}
-		| {type: 'tool_errored'; toolCallId: string; error: string}
+		| {type: 'tool_errored'; toolCallId: string; toolName: string; error: string}
 		| {
 				type: 'subagent_start';
 				toolCallId: string;
@@ -53,7 +54,7 @@ declare module '@commandcode/harness' {
 				toolInput: unknown;
 				tokensUsed: number;
 		  }
-		| {type: 'subagent_stop'; toolCallId: string; subagentType: string; tokensUsed: number}
+		| {type: 'subagent_stop'; toolCallId: string; subagentType: string; tokensUsed: number; status?: string}
 		| {type: 'notice'; level: string; message: string}
 		| {type: 'interrupted'}
 		| {type: 'run_error'; error?: unknown}

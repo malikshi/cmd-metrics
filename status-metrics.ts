@@ -2,9 +2,10 @@
 //
 // exports: default | SessionAverages | tpsText | formatDuration | formatTokens | formatRate | formatPercent | cachePercent | parseUsageBlock | modelLabel | sessionAverages
 // used_by: tests/metrics.test.ts → formatters, sessionAverages, parseUsageBlock, modelLabel, default
-// rules:   Every figure comes from the public mod API; no Command Code internals are patched. A request with no observed first token reports no TTFT and no TPS. Store writes are serialized through one chain. Each rendered line owns its own token total: parent tokens never include a child's.
+// rules:   Every figure comes from the public mod API; no Command Code internals are patched. A request with no observed first token reports no TTFT and no TPS. Store writes are serialized through one chain, each snapshot captured synchronously per session. Each rendered line owns its own token total: parent tokens never include a child's. A child outlives neither its agent tool nor a run_end unless it is a background child.
 // agent:   claude-sonnet-4 | anthropic | 2026-11-02 | code-review | split the token totals per line so no parent figure mixes in sub-agent usage
 // agent:   claude-sonnet-4 | anthropic | 2026-11-02 | code-review | fixed k/M and percent boundary rounding, clamped the session cache rate, cleared phantom live state on run_end, hardened restore against malformed rows, surfaced store write failures, and completed CodeDNA headers
+// agent:   unknown | anthropic | 2026-11-02 | goal-review | closed children on tool_errored and run_end, spared background children, snapshotted each save per session, and type-checked restored rows
 
 import type {ModApi} from '@commandcode/harness';
 
@@ -23,6 +24,34 @@ const INDEX_KEY = 'sessions';
 const MAX_PERSISTED_SESSIONS = 20;
 
 const sessionKey = (sessionId: string): string => `${SESSION_KEY_PREFIX}${sessionId}`;
+
+// Rules:   the fields the arithmetic reads directly. A hand-edited store file can hold any JSON
+// type, so restore drops a value that is not a finite number rather than letting it reach a sum.
+const REQUEST_NUMERIC_FIELDS = [
+	'startedAt',
+	'firstTokenAt',
+	'endedAt',
+	'durationMs',
+	'ttftMs',
+	'outputTokens',
+	'inputTokens',
+	'cacheReadTokens',
+	'cacheWriteTokens',
+	'cachePercent',
+	'tps',
+] as const;
+const SUBAGENT_NUMERIC_FIELDS = [
+	'startedAt',
+	'firstActivityAt',
+	'lastActivityAt',
+	'endedAt',
+	'durationMs',
+	'ttftMs',
+	'toolCalls',
+	'tokens',
+	'tokensUsed',
+	'tps',
+] as const;
 
 interface Usage {
 	inputTokens?: number;
@@ -64,6 +93,8 @@ interface SubagentRecord {
 	tokensUsed?: number;
 	tps?: number;
 	status?: string;
+	// Rules:   a background child outlives the run that spawned it, so run_end must not close it.
+	background?: boolean;
 }
 
 interface RequestMetric {
@@ -101,18 +132,18 @@ export interface SessionAverages {
 	avgTps?: number;
 	avgDurationMs?: number;
 	cachePercent?: number;
-	// Parent requests only. A child is its own inference call with its own usage, so its tokens
-	// are reported on the sub-agent line instead of inflating this one.
+	// Rules:   parent requests only — a child is its own inference call, so its tokens are reported
+	// on the sub-agent line instead of inflating this one.
 	totalTokens: number;
 	subagentTotalTokens: number;
-	// Kept as their own block rather than folded into the parent averages above: a child's
-	// TTFT is spawn → first forwarded event, which is not comparable with a measured one.
+	// Rules:   kept in their own block rather than folded into the parent averages above, because a
+	// child's TTFT is spawn → first forwarded event, which is not comparable with a measured one.
 	subagentAvgTtftMs?: number;
 	subagentAvgTps?: number;
 	subagentAvgDurationMs?: number;
 	subagentToolCalls?: number;
-	// How many parent requests had no decode timeline, so their rate is wall clock and excluded
-	// from avgTps. Absent when every request was measured.
+	// Rules:   how many requests published a wall-clock rate, which avgTps excludes. Absent when
+	// every rate was measured.
 	wallClockRequests?: number;
 }
 
@@ -238,10 +269,12 @@ export function sessionAverages(
 	);
 	if (avgTps !== undefined) averages.avgTps = avgTps;
 	// Rules:   the count travels with the average, so a caller can say how many rates it covers.
-	const measuredRates = requests.filter(
-		record => !record.wallClockRate && record.tps !== undefined,
+	// Only a request that actually published a wall-clock rate was excluded — one that never had a
+	// rate (a cancelled request) is not an excluded measurement, so it must not be counted as one.
+	const wallClockRates = requests.filter(
+		record => record.wallClockRate && record.tps !== undefined,
 	).length;
-	if (measuredRates < requests.length) averages.wallClockRequests = requests.length - measuredRates;
+	if (wallClockRates > 0) averages.wallClockRequests = wallClockRates;
 	const avgDurationMs = averageOf(
 		requests
 			.map(record => record.durationMs)
@@ -339,10 +372,17 @@ export default function (cmd: ModApi): void {
 		history = requests.filter(
 			(record): record is RequestRecord => isRecord(record) && typeof record.model === 'string',
 		);
-		// Rules:   the file may hold rows written before wall-clock marking existed. A rate above
-		// TPS_MAX was never a decode rate, so it must not enter the measured average either.
+		// Rules:   the file may hold rows written before wall-clock marking existed, and a hand-edited
+		// row can carry any JSON type. Every numeric field is type-checked here, because a string
+		// reaching the arithmetic renders as "0many5" or a null average. A rate above TPS_MAX was
+		// never a decode rate, so it must not enter the measured average either.
 		for (const record of history) {
-			if (typeof record.tps === 'number' && record.tps > TPS_MAX) {
+			for (const field of REQUEST_NUMERIC_FIELDS) {
+				if (typeof record[field] !== 'number' || !Number.isFinite(record[field])) {
+					delete record[field];
+				}
+			}
+			if (record.tps !== undefined && !(record.tps > 0 && record.tps <= TPS_MAX)) {
 				record.tps = undefined;
 				record.wallClockRate = true;
 			}
@@ -351,12 +391,17 @@ export default function (cmd: ModApi): void {
 		for (const subagent of Array.isArray(stored.subagents) ? stored.subagents : []) {
 			if (!isRecord(subagent) || typeof subagent.toolCallId !== 'string') continue;
 			const record = subagent as unknown as SubagentRecord;
-			// Rules:   fill the fields a render reads directly, since formatDuration/formatRate tolerate undefined but the raw text and arithmetic do not.
+			// Rules:   fill the fields a render reads directly, since formatDuration/formatRate tolerate undefined but the raw text and arithmetic do not. A hand-edited file can hold any JSON type, so every numeric field is type-checked rather than trusted.
 			if (typeof record.type !== 'string') record.type = 'agent';
 			if (typeof record.description !== 'string') record.description = '';
-			if (typeof record.toolCalls !== 'number') record.toolCalls = 0;
-			if (typeof record.tokens !== 'number') record.tokens = 0;
-			if (typeof record.startedAt !== 'number') record.startedAt = 0;
+			for (const field of SUBAGENT_NUMERIC_FIELDS) {
+				if (typeof record[field] !== 'number' || !Number.isFinite(record[field])) {
+					delete record[field];
+				}
+			}
+			record.toolCalls ??= 0;
+			record.tokens ??= 0;
+			record.startedAt ??= 0;
 			subagents.set(record.toolCallId, record);
 		}
 	};
@@ -381,28 +426,42 @@ export default function (cmd: ModApi): void {
 	};
 
 	// Rules: cmd.store.set rewrites the whole store file on every call, so writing once per request
-	// makes a long session O(n) whole-file rewrites. Coalesce instead: at most one write is queued,
-	// and it persists the state as of the moment it drains, so a burst costs one write rather than
-	// one per event. The snapshot is copied synchronously before the first await, so the array and
-	// its records can never be torn apart by a later mutation.
-	let saveQueued = false;
+	// makes a long session O(n) whole-file rewrites. Coalesce instead: one drain writes each pending
+	// session once, and a burst costs one write rather than one per event.
+	// Rules:   the snapshot is captured HERE, synchronously, so the array and its records can never
+	// be torn apart by a later mutation, and a write queued by onSessionEnd cannot drain after
+	// onSessionStart has replaced history — which would file the new session's figures under the old
+	// session's key. Pending data is keyed by session, so a second save REPLACES that session's
+	// snapshot with the newer one (coalescing never drops data) and a session switch never
+	// suppresses the new session's save.
+	const snapshotNow = (id: string): PersistedSession => ({
+		sessionId: id,
+		requests: history.slice(),
+		subagents: [...subagents.values()].map(subagent => ({...subagent})),
+	});
+	const pendingSaves = new Map<string, PersistedSession>();
+	let isDrainQueued = false;
 	const save = (id: string | undefined): void => {
-		if (id === undefined || saveQueued) return;
-		saveQueued = true;
-		const key = sessionKey(id);
+		if (id === undefined) return;
+		pendingSaves.set(id, snapshotNow(id));
+		if (isDrainQueued) return;
+		isDrainQueued = true;
 		enqueueWrite(async () => {
-			saveQueued = false;
-			const snapshot: PersistedSession = {
-				sessionId: id,
-				requests: history.slice(),
-				subagents: [...subagents.values()].map(subagent => ({...subagent})),
-			};
-			const known = cmd.store.get<string[]>(INDEX_KEY);
-			const ordered = [id, ...(Array.isArray(known) ? known.filter(entry => entry !== id) : [])];
-			await cmd.store.set(key, snapshot);
-			await cmd.store.set(INDEX_KEY, ordered.slice(0, MAX_PERSISTED_SESSIONS));
-			for (const evicted of ordered.slice(MAX_PERSISTED_SESSIONS)) {
-				await cmd.store.delete(sessionKey(evicted));
+			isDrainQueued = false;
+			const pending = [...pendingSaves];
+			pendingSaves.clear();
+			for (const [pendingId, snapshot] of pending) {
+				const key = sessionKey(pendingId);
+				const known = cmd.store.get<string[]>(INDEX_KEY);
+				const ordered = [
+					pendingId,
+					...(Array.isArray(known) ? known.filter(entry => entry !== pendingId) : []),
+				];
+				await cmd.store.set(key, snapshot);
+				await cmd.store.set(INDEX_KEY, ordered.slice(0, MAX_PERSISTED_SESSIONS));
+				for (const evicted of ordered.slice(MAX_PERSISTED_SESSIONS)) {
+					await cmd.store.delete(sessionKey(evicted));
+				}
 			}
 		});
 	};
@@ -866,6 +925,7 @@ export default function (cmd: ModApi): void {
 			toolCallId?: unknown;
 			subagentType?: unknown;
 			description?: unknown;
+			background?: unknown;
 		};
 		if (typeof payload.toolCallId !== 'string') return;
 		const startedAt = Date.now();
@@ -876,6 +936,7 @@ export default function (cmd: ModApi): void {
 			startedAt,
 			toolCalls: 0,
 			tokens: 0,
+			...(payload.background === true ? {background: true} : {}),
 		});
 		repaint();
 	});
@@ -928,14 +989,16 @@ export default function (cmd: ModApi): void {
 		repaint();
 	});
 
-	// A child whose run was aborted never receives subagent_stop, so it would keep rendering as
-	// running with a duration that grows forever — and get persisted that way. Close the ones the
-	// abort orphans. Background children outlive a single run, so they are left alone.
+	// A child that never got subagent_stop would keep rendering as running forever, and persist
+	// that way. Close the ones the abort or the run's end orphans.
 	// Rules:   a child that never emitted a progress event was likely never started; drop it rather
-	// than persist a zero-duration phantom.
-	const finishOrphanedSubagents = (): void => {
+	// than persist a zero-duration phantom. Returns whether anything changed, so a caller only
+	// schedules a write when there is something new to write.
+	const finishOrphanedSubagents = (): boolean => {
+		let changed = false;
 		for (const [id, subagent] of subagents) {
-			if (subagent.endedAt !== undefined) continue;
+			if (subagent.endedAt !== undefined || subagent.background === true) continue;
+			changed = true;
 			if (subagent.firstActivityAt === undefined) {
 				subagents.delete(id);
 				continue;
@@ -944,40 +1007,51 @@ export default function (cmd: ModApi): void {
 			subagent.status = 'interrupted';
 			finalizeSubagent(subagent);
 		}
+		return changed;
 	};
 
-	cmd.on('tool_completed', event => {
-		const payload = event as {toolCallId?: unknown; toolName?: unknown; result?: unknown};
-		if (payload.toolName !== 'agent' || typeof payload.toolCallId !== 'string') return;
-		const subagent = subagents.get(payload.toolCallId);
+	// Rules:   the host emits tool_errored instead of tool_completed when the child run fails, and
+	// the tool result is then the error text — the same usage block arrives on either path, so both
+	// must refine the row. Reading only tool_completed leaves a failed child open indefinitely.
+	const onAgentToolEnd = (event: {
+		toolCallId?: unknown;
+		toolName?: unknown;
+		result?: unknown;
+		error?: unknown;
+	}): void => {
+		if (event.toolName !== 'agent' || typeof event.toolCallId !== 'string') return;
+		const subagent = subagents.get(event.toolCallId);
 		if (!subagent) return;
-		const usage = parseUsageBlock(resultText(payload.result));
+		const usage = parseUsageBlock(resultText(event.result ?? event.error));
 		if (usage.durationMs !== undefined) subagent.durationMs = usage.durationMs;
 		if (usage.totalTokens !== undefined) subagent.tokensUsed = usage.totalTokens;
-		// Rules:   with no usage block there is no duration to trust — leave the child running and let subagent_stop close it, never end it at zero elapsed time.
+		// Rules:   with no usage block there is no duration to trust — leave the child running and let subagent_stop or run_end close it, never end it at zero elapsed time.
 		if (subagent.durationMs !== undefined) {
 			subagent.endedAt ??= subagent.startedAt + subagent.durationMs;
 		}
 		finalizeSubagent(subagent);
 		repaint();
-	});
+	};
+
+	cmd.on('tool_completed', onAgentToolEnd);
+	cmd.on('tool_errored', onAgentToolEnd);
 
 	cmd.on('run_end', () => {
 		// A cancelled or failed request never emits model_request_end, so the live state must be
 		// dropped here or the spinner reports a phantom request forever.
 		reset();
+		if (finishOrphanedSubagents()) save(sessionId);
 		if (history.length > 0) cmd.ui.notify(summaryLine());
 	});
 
-	// The host emits these from inside the run loop and breaks out before model_request_end, so an
-	// aborted request has no usage to record — there is no row to write. The spinner must stop
-	// counting it, though, and run_end follows immediately, so releasing live state here is what
-	// keeps a phantom request off the spinner.
+	// The host emits these inside the run loop and breaks out before model_request_end, so an
+	// aborted request has no usage. Releasing the live request here keeps it off the spinner.
+	// Rules:   the write is scheduled only when a live child was actually closed, so an abort with
+	// nothing to record never rewrites the whole store file.
 	const abortCurrent = (): void => {
 		current = undefined;
 		resetRate();
-		finishOrphanedSubagents();
-		save(sessionId);
+		if (finishOrphanedSubagents()) save(sessionId);
 		repaint();
 	};
 	cmd.on('interrupted', abortCurrent);

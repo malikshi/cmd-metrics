@@ -67,7 +67,13 @@ are deleted from the file rather than accumulating.
 
 Writes are serialized through a single promise chain, because `cmd.store.set` rewrites the whole
 file with no lock — two overlapping writes would corrupt the JSON, and a parse failure makes the
-host drop every stored session silently.
+host drop every stored session silently. Each write is captured when the request finishes, not
+when the queue drains, and is keyed by its own session, so a session switch can neither file one
+session's figures under another's key nor swallow the next session's save. A burst of requests
+coalesces into one write carrying the latest figures, never a dropped one.
+
+Restored rows are type-checked before they reach any arithmetic: the store file is user-editable,
+so a field that is not a finite number is dropped instead of rendering as `NaN` or `0many5`.
 
 Reload a mod in place with `/mods reload status-metrics`; `/reload` restarts the process and
 resumes the session.
@@ -110,11 +116,11 @@ Between requests it shows the last request's summary, and every running sub-agen
 
 ```
 Requests
-  #1 deepseek-v4.1-flash  TTFT 1.6s  ⏱ 2.1s  132 tok  cache 51%  263 t/s  tool_calls
-  #2 deepseek-v4.1-flash  TTFT 1.7s  ⏱ 1.8s   14 tok  cache 99%  165 t/s  stop
+  #1 deepseek-v4.1-flash  TTFT 1.6s  ⏱ 2.1s  132 tok  cache 51%  264 t/s  tool_calls
+  #2 deepseek-v4.1-flash  TTFT 1.7s  ⏱ 1.8s   14 tok  cache 99%  140 t/s  stop
 
 Sub-agents
-  ✓ ⑂general  Run echo cache  TTFT 1.7s  ⏱ 3.9s  21k tok  9.4k t/s  1 tool call(s)
+  ✓ ⑂general  Run echo cache  TTFT 1.7s  ⏱ 3.9s  21k tok  9.5k t/s  1 tool call(s)
 ```
 
 `/metrics` also prints a one-line summary; the run-end notice repeats it. The session cache
@@ -133,7 +139,10 @@ Everything comes from the public mod API — no patching of Command Code interna
   rate divides by `inputTokens` directly.
 - **Sub-agents.** `subagent_start` / `subagent_progress` / `subagent_stop` bracket a child run,
   and the `<usage>` block in the `agent` tool result carries its exact duration and token
-  total.
+  total. That block arrives on the `tool_completed` path, and on `tool_errored` when the child
+  failed, so both are read. A child that never reported a stop — an abort, or a run that ended
+  under it — is closed at `run_end` as `interrupted`; a background child is left running,
+  because it outlives the run that spawned it.
 
 ### The one number that is approximate
 
@@ -147,7 +156,7 @@ implying token-level precision. Its duration, token count and TPS are exact.
 ## Development
 
 ```bash
-npm test        # 69 unit tests, no build step (node --experimental-strip-types)
+npm test        # 80 unit tests, no build step (node --experimental-strip-types)
 npm run typecheck
 ```
 
