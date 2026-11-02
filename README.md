@@ -32,6 +32,17 @@ The averages stay request-only on purpose: a sub-agent's TTFT is approximate, so
 mixed into a measured one. Its tokens still count toward the total, because each child is its
 own inference call. `/metrics` repeats the same figures as a one-line summary.
 
+They are **session-wide**: every request of the session is kept, so request 200 still includes
+request 1. The pane draws only the most recent 50 rows (`… N earlier request(s)`), but the
+totals and averages never truncate.
+
+A request whose first token was never observed (a cancelled or failed call) reports no TTFT and
+no TPS — `—`, not its duration dressed up as a measurement. It still counts in the request
+total, the token total and the cache rate.
+
+Tokens and rates roll over at the unit boundary: `999_999` reads `1.0M` (never `1000k`), and a
+rate is rounded before its unit is chosen, so `999.7 t/s` reads `1.0k t/s`.
+
 ## Install
 
 ```bash
@@ -100,7 +111,7 @@ implying token-level precision. Its duration, token count and TPS are exact.
 ## Development
 
 ```bash
-npm test        # 27 unit tests, no build step (node --experimental-strip-types)
+npm test        # 33 unit tests, no build step (node --experimental-strip-types)
 npm run typecheck
 ```
 

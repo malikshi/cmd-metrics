@@ -9,8 +9,10 @@ const TPS_MIN_WINDOW_MS = 800;
 const TPS_PAUSE_MS = 1_500;
 const TPS_MAX = 1_000;
 const TPS_SMOOTHING = 0.25;
-const HISTORY_LIMIT = 50;
+const HISTORY_DISPLAY_LIMIT = 50;
 const SPINNER_SUBAGENTS = 3;
+const TOKENS_PER_K = 1_000;
+const TOKENS_PER_M = 1_000_000;
 const PANE_ID = 'metrics';
 
 interface Usage {
@@ -104,8 +106,8 @@ export function tpsText(tps: number): string {
 	return `TPS ${value}`;
 }
 
-export function formatDuration(ms: number): string {
-	if (!Number.isFinite(ms) || ms < 0) return '—';
+export function formatDuration(ms: number | undefined): string {
+	if (ms === undefined || !Number.isFinite(ms) || ms < 0) return '—';
 	if (ms < 1_000) return `${(ms / 1_000).toFixed(2)}s`;
 	if (ms < 10_000) return `${(ms / 1_000).toFixed(1)}s`;
 	const totalSeconds = Math.round(ms / 1_000);
@@ -116,18 +118,21 @@ export function formatDuration(ms: number): string {
 
 export function formatTokens(tokens: number): string {
 	if (!Number.isFinite(tokens) || tokens <= 0) return '0';
-	if (tokens < 1_000) return String(Math.round(tokens));
-	if (tokens < 1_000_000) {
-		const value = tokens / 1_000;
-		return `${value < 10 ? value.toFixed(1) : Math.round(value)}k`;
+	if (tokens < TOKENS_PER_K) return String(Math.round(tokens));
+	// Round inside the k unit first: 999,999 must read 1.0M, never 1000k.
+	const thousands = tokens / TOKENS_PER_K;
+	if (Math.round(thousands) < TOKENS_PER_K) {
+		return `${thousands < 10 ? thousands.toFixed(1) : Math.round(thousands)}k`;
 	}
-	return `${(tokens / 1_000_000).toFixed(1)}M`;
+	return `${(tokens / TOKENS_PER_M).toFixed(1)}M`;
 }
 
 export function formatRate(tps: number | undefined): string {
 	if (tps === undefined || !Number.isFinite(tps) || tps <= 0) return '—';
-	if (tps >= 1_000) return `${(tps / 1_000).toFixed(1)}k t/s`;
-	return `${tps >= 10 ? Math.round(tps) : Math.round(tps * 10) / 10} t/s`;
+	const rounded = tps >= 10 ? Math.round(tps) : Math.round(tps * 10) / 10;
+	// Decide on the rounded value so 999.7 reports 1.0k t/s, not 1000 t/s.
+	if (rounded < TOKENS_PER_K) return `${rounded} t/s`;
+	return `${(tps / TOKENS_PER_K).toFixed(1)}k t/s`;
 }
 
 // inputTokens counts the whole prompt, cache reads AND cache writes included: the cost
@@ -236,6 +241,9 @@ function resultText(result: unknown): string {
 
 export default function (cmd: ModApi): void {
 	let current: RequestRecord | undefined;
+	// Every request of the session is kept: the session figures are contractually session-wide,
+	// and shifting the array at 50 would silently turn them into a trailing window. Only the
+	// pane caps what it draws.
 	let history: RequestRecord[] = [];
 	const subagents = new Map<string, SubagentRecord>();
 	let samples: {at: number; tokens: number}[] = [];
@@ -333,7 +341,7 @@ export default function (cmd: ModApi): void {
 			if (last) {
 				nodes.push({
 					type: 'text',
-					text: `⏱ ${formatDuration(last.durationMs ?? 0)} · TTFT ${formatDuration(last.ttftMs ?? 0)} · ${formatRate(last.tps)} · cache ${formatPercent(last.cachePercent)}`,
+					text: `⏱ ${formatDuration(last.durationMs)} · TTFT ${formatDuration(last.ttftMs)} · ${formatRate(last.tps)} · cache ${formatPercent(last.cachePercent)}`,
 					dim: true,
 				});
 			}
@@ -426,14 +434,24 @@ export default function (cmd: ModApi): void {
 		if (history.length === 0 && !current) {
 			lines.push({type: 'text', text: 'no model requests yet in this run', dim: true});
 		}
+		// Oldest rows are dropped from the pane, never renumbered: #57 must stay #57.
+		const firstShown = Math.max(0, history.length - HISTORY_DISPLAY_LIMIT);
+		if (firstShown > 0) {
+			lines.push({
+				type: 'text',
+				text: `… ${firstShown} earlier request(s) in the session totals`,
+				dim: true,
+			});
+		}
 		for (const [index, record] of history.entries()) {
+			if (index < firstShown) continue;
 			lines.push({
 				type: 'row',
 				children: [
 					{type: 'text', text: `#${index + 1}`, dim: true},
 					{type: 'text', text: modelLabel(record.model)},
-					{type: 'text', text: `TTFT ${formatDuration(record.ttftMs ?? 0)}`, color: 'green'},
-					{type: 'text', text: `⏱ ${formatDuration(record.durationMs ?? 0)}`},
+					{type: 'text', text: `TTFT ${formatDuration(record.ttftMs)}`, color: 'green'},
+					{type: 'text', text: `⏱ ${formatDuration(record.durationMs)}`},
 					{type: 'text', text: `${formatTokens(record.outputTokens ?? 0)} tok`, dim: true},
 					{type: 'text', text: `cache ${formatPercent(record.cachePercent)}`, color: 'yellow'},
 					{type: 'text', text: formatRate(record.tps), color: 'cyan'},
@@ -576,21 +594,25 @@ export default function (cmd: ModApi): void {
 		const payload = event as {usage?: Usage; stopReason?: unknown};
 		const endedAt = Date.now();
 		const durationMs = endedAt - current.startedAt;
+		// A request whose first token was never observed has no TTFT. Recording the duration
+		// instead would turn prefill into a measured TTFT and drag the session average up.
 		const ttftMs =
 			current.firstTokenAt === undefined
-				? durationMs
+				? undefined
 				: current.firstTokenAt - current.startedAt;
 		const outputTokens = Number(payload.usage?.outputTokens ?? 0) || 0;
-		const generationMs = durationMs - ttftMs;
+		const generationMs = ttftMs === undefined ? undefined : durationMs - ttftMs;
 		const tps =
-			outputTokens > 0 && generationMs > 0 ? outputTokens / (generationMs / 1_000) : undefined;
+			outputTokens > 0 && generationMs !== undefined && generationMs > 0
+				? outputTokens / (generationMs / 1_000)
+				: undefined;
 		const record: RequestRecord = {
 			...current,
 			endedAt,
 			durationMs,
-			ttftMs,
 			outputTokens,
 		};
+		if (ttftMs !== undefined) record.ttftMs = ttftMs;
 		const inputTokens = Number(payload.usage?.inputTokens ?? 0) || 0;
 		if (inputTokens > 0) record.inputTokens = inputTokens;
 		const cacheReadTokens = Number(payload.usage?.cacheReadTokens ?? 0) || 0;
@@ -602,7 +624,6 @@ export default function (cmd: ModApi): void {
 		if (tps !== undefined) record.tps = tps;
 		if (typeof payload.stopReason === 'string') record.stopReason = payload.stopReason;
 		history.push(record);
-		if (history.length > HISTORY_LIMIT) history.shift();
 		current = undefined;
 		resetRate();
 		repaint();
@@ -682,7 +703,11 @@ export default function (cmd: ModApi): void {
 		const usage = parseUsageBlock(resultText(payload.result));
 		if (usage.durationMs !== undefined) subagent.durationMs = usage.durationMs;
 		if (usage.totalTokens !== undefined) subagent.tokensUsed = usage.totalTokens;
-		subagent.endedAt ??= subagent.startedAt + (subagent.durationMs ?? 0);
+		// Without a usage block there is no duration to trust: leave the child running and let
+		// subagent_stop close it, instead of ending it at zero elapsed time.
+		if (subagent.durationMs !== undefined) {
+			subagent.endedAt ??= subagent.startedAt + subagent.durationMs;
+		}
 		finalizeSubagent(subagent);
 		repaint();
 	});

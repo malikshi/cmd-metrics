@@ -498,3 +498,86 @@ test('/metrics summary reports average duration and total tokens', () => {
 	assert.match(message, /avg duration 1\.0s/);
 	assert.match(message, /total 1\.1k tok/);
 });
+
+test('formatTokens rolls over at the k boundary instead of printing 1000k', () => {
+	assert.equal(formatTokens(999_499), '999k');
+	assert.equal(formatTokens(999_999), '1.0M');
+	assert.equal(formatTokens(1_000_000), '1.0M');
+});
+
+test('formatRate rounds before choosing the unit', () => {
+	assert.equal(formatRate(999.7), '1.0k t/s');
+	assert.equal(formatRate(999.4), '999 t/s');
+	assert.equal(formatRate(1_000), '1.0k t/s');
+});
+
+test('formatDuration renders a missing duration as a dash', () => {
+	assert.equal(formatDuration(undefined), '—');
+	assert.equal(formatDuration(0), '0.00s');
+});
+
+test('a request that never streamed a token reports no TTFT and no TPS', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/one'});
+	advance(2_000);
+	// No thinking_delta / text_delta / message_update: the first token was never observed.
+	h.emit('model_request_end', {usage: {inputTokens: 900, outputTokens: 0}});
+
+	const paneText = flat(h.pane());
+	// Duration is still real, but TTFT must not be the duration dressed up as a measurement.
+	assert.match(paneText, /TTFT —/);
+	assert.match(paneText, /⏱ 2\.0s/);
+
+	const message = h.command().message;
+	assert.doesNotMatch(message, /avg TTFT/);
+
+	// And it must not enter the session TTFT average.
+	h.emit('model_request_start', {model: 'm/two'});
+	advance(300);
+	h.emit('text_delta', {delta: 'x'});
+	advance(200);
+	h.emit('model_request_end', {usage: {outputTokens: 10}});
+	assert.match(h.command().message, /avg TTFT 0\.30s/);
+});
+
+test('session averages stay session-wide past the pane display cap', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/one'});
+	advance(1_000);
+	h.emit('text_delta', {delta: 'x'});
+	h.emit('model_request_end', {usage: {outputTokens: 10}});
+
+	// 55 more fast requests. A trailing-50 window would keep only these and report 0.10s.
+	for (let index = 0; index < 55; index += 1) {
+		h.emit('model_request_start', {model: 'm/fast'});
+		advance(100);
+		h.emit('text_delta', {delta: 'x'});
+		h.emit('model_request_end', {usage: {outputTokens: 10}});
+	}
+
+	// (1000 + 55 × 100) ÷ 56 = 6,500ms ÷ 56 = 116ms. A trailing-50 window of only the fast
+	// requests would report 0.10s and 50 requests.
+	assert.match(h.command().message, /56 request/);
+	assert.match(h.command().message, /avg TTFT 0\.12s/);
+
+	// The pane still caps its rows and numbers the survivors by true position.
+	const paneText = flat(h.pane());
+	assert.match(paneText, /… 6 earlier request/);
+	assert.match(paneText, /#7 \| fast/);
+	assert.doesNotMatch(paneText, /#1 \|/);
+});
+
+test('an agent tool result without a usage block does not close the child at zero', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('subagent_start', {toolCallId: 'c1', subagentType: 'general', description: 'work'});
+	advance(1_500);
+	h.emit('tool_completed', {toolCallId: 'c1', toolName: 'agent', result: 'no usage here'});
+
+	// Still running: the elapsed time stays live instead of freezing at 0.00s.
+	const text = flat(h.pane());
+	assert.match(text, /▶/);
+	assert.match(text, /⏱ 1\.5s/);
+});
