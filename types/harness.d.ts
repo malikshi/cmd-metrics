@@ -81,10 +81,10 @@ declare module '@commandcode/harness' {
 		setStatus(text: string | null): {dispose(): void};
 		widget(widget: {
 			placement: 'above-editor' | 'below-editor';
-			render: (width: number) => readonly ModUiNode[];
+			render: () => readonly ModUiNode[];
 		}): {dispose(): void};
 		refreshWidgets(): void;
-		pane(pane: {id: string; title?: string; render: (width: number) => readonly ModUiNode[]}): {
+		pane(pane: {id: string; title?: string; render: () => readonly ModUiNode[]}): {
 			dispose(): void;
 		};
 		openPane(id: string, options?: {focus?: boolean}): void;

@@ -12,8 +12,6 @@ const {
 	parseUsageBlock,
 	modelLabel,
 	sessionAverages,
-	detailFor,
-	truncate,
 } = await import('../status-metrics.ts');
 
 function createHarness() {
@@ -88,16 +86,16 @@ function createHarness() {
 			const render = overrides.get('spinner')!;
 			return render({status: 'working', elapsedMs: 0, tokens}, undefined) ?? [];
 		},
-		pane(id = 'metrics', width = 80) {
-			return panes.get(id)!.render(width);
+		pane(id = 'metrics') {
+			return panes.get(id)!.render({width: 80});
 		},
 		command(name = 'metrics') {
 			return commands.get(name)!.handler({args: '', ui: cmd.ui, cwd: '/tmp', exec: async () => ({stdout: '', stderr: '', code: 0})});
 		},
 		notices,
-		widget(placement = 'below-editor', width = 80) {
+		widget(placement = 'below-editor') {
 			const widget = widgets.find(entry => entry.placement === placement);
-			return widget ? widget.render(width) : [];
+			return widget ? widget.render() : [];
 		},
 		get widgetRefreshes() {
 			return widgetRefreshes;
@@ -499,87 +497,4 @@ test('/metrics summary reports average duration and total tokens', () => {
 	assert.match(message, /avg TTFT 0\.40s/);
 	assert.match(message, /avg duration 1\.0s/);
 	assert.match(message, /total 1\.1k tok/);
-});
-
-test('detailFor picks a tier per width, including the 40-72 cell docked pane', () => {
-	assert.equal(detailFor(120), 'full');
-	assert.equal(detailFor(66), 'full');
-	assert.equal(detailFor(65), 'wide');
-	assert.equal(detailFor(40), 'mid');
-	assert.equal(detailFor(39), 'narrow');
-	assert.equal(detailFor(10), 'narrow');
-});
-
-test('truncate adds an ellipsis only when the text does not fit', () => {
-	assert.equal(truncate('short', 10), 'short');
-	assert.equal(truncate('abcdef', 4), 'abc…');
-	assert.equal(truncate('abcdef', 0), '');
-});
-
-test('a narrow pane drops the widest request fields instead of being cut off', () => {
-	const h = createHarness();
-	h.emit('run_start');
-	h.emit('model_request_start', {model: 'm/one'});
-	advance(100);
-	h.emit('text_delta', {delta: 'x'});
-	advance(100);
-	h.emit('model_request_end', {
-		usage: {inputTokens: 20_000, outputTokens: 50, cacheReadTokens: 15_000},
-		stopReason: 'tool_calls',
-	});
-
-	const full = flat(h.pane('metrics', 80));
-	assert.match(full, /TTFT 0\.10s/);
-	assert.match(full, /50 tok/);
-	assert.match(full, /cache 75%/);
-	assert.match(full, /tool_calls/);
-
-	const narrow = flat(h.pane('metrics', 30));
-	assert.match(narrow, /#1/);
-	assert.match(narrow, /⏱ 0\.20s/);
-	assert.doesNotMatch(narrow, /cache/);
-	assert.doesNotMatch(narrow, /tool_calls/);
-});
-
-test('the below-editor widget trims to the essentials in a narrow terminal', () => {
-	const h = createHarness();
-	h.emit('run_start');
-	h.emit('model_request_start', {model: 'm/one'});
-	advance(400);
-	h.emit('text_delta', {delta: 'x'});
-	advance(600);
-	h.emit('model_request_end', {usage: {inputTokens: 1_000, outputTokens: 60, cacheReadTokens: 700}});
-
-	const full = flat(h.widget('below-editor', 80));
-	assert.match(full, /session \| TTFT 0\.40s/);
-	assert.match(full, /cache 70%/);
-
-	const narrow = flat(h.widget('below-editor', 30));
-	assert.match(narrow, /session \| 100 t\/s/);
-	assert.match(narrow, /1\.1k tok/);
-	assert.doesNotMatch(narrow, /cache/);
-	assert.doesNotMatch(narrow, /TTFT/);
-});
-
-test('a narrow sub-agent row keeps the type, time and tokens it can fit', () => {
-	const h = createHarness();
-	h.emit('run_start');
-	h.emit('subagent_start', {
-		toolCallId: 'c1',
-		subagentType: 'explore',
-		description: 'Find auth code in the repo',
-	});
-	advance(500);
-	h.emit('subagent_progress', {toolCallId: 'c1', tokensUsed: 1_200, toolName: 'grep'});
-	h.emit('subagent_stop', {toolCallId: 'c1', tokensUsed: 20_370});
-
-	const wide = flat(h.pane('metrics', 80));
-	assert.match(wide, /Find auth code in the repo/);
-	assert.match(wide, /1 tool call\(s\)/);
-
-	const mid = flat(h.pane('metrics', 40));
-	assert.match(mid, /⑂explore/);
-	assert.match(mid, /20k tok/);
-	assert.doesNotMatch(mid, /Find auth code/);
-	assert.doesNotMatch(mid, /tool call\(s\)/);
 });
