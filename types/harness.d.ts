@@ -1,3 +1,10 @@
+// harness.d.ts — the slice of the bundled @commandcode/harness API this mod compiles against.
+//
+// exports: ModApi | ModUi | ModStoreApi | ModStateApi | ModHooks | AgentEvent | AgentUsage | ModFactory
+// used_by: status-metrics.ts → ModApi [cascade]
+// related: tsconfig.json includes this file so tsc checks the mod against the real surface.
+// rules:   mirror only what the mod uses; never invent a field the CLI does not provide.
+// agent:   claude-sonnet-4 | anthropic | 2026-11-02 | code-review | added the L1 header
 declare module '@commandcode/harness' {
 	export interface ModContext {
 		emit(event: {type: string}): void;

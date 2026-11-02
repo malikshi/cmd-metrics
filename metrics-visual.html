@@ -1,3 +1,10 @@
+<!-- metrics-visual.html — tracked explainer page for how each metric is measured.
+
+exports: none
+used_by: none
+rules:   static explainer only; every figure must match the mod's real formulas.
+agent:   claude-sonnet-4 | anthropic | 2026-11-02 | code-review | removed section dividers, added the L1 header
+-->
 <!doctype html>
 <html lang="en">
 <head>
@@ -101,8 +108,6 @@
 
   <h1>cmd-metrics <span>— what each number actually measures</span></h1>
   <p class="sub">One model request has two phases. Every metric in the mod is a ratio of those phases.</p>
-
-  <!-- ================= 1. THE REQUEST ================= -->
   <h2>1 · Anatomy of one model request</h2>
   <div class="panel">
     <div class="trow">
@@ -134,8 +139,6 @@
     <p class="cap">Why subtract TTFT? Prefill is not generation. Dividing 132 ÷ 2.1s would report 63 t/s
       and blame the model for a slow prompt read. The mod never does that.</p>
   </div>
-
-  <!-- ================= 2. CACHE ================= -->
   <h2>2 · cache % — how much of the prompt was reused</h2>
   <div class="panel">
     <div class="tname" style="text-align:left;margin-bottom:6px">request #1 prompt · 27,947 input tokens</div>
@@ -149,8 +152,6 @@
     <p class="cap"><code>inputTokens</code> already counts cached tokens — Command Code subtracts cache reads
       back out before pricing fresh input. So the divisor is the whole prompt, never the fresh slice.</p>
   </div>
-
-  <!-- ================= 3. SESSION ================= -->
   <h2>3 · A 3-request session, and where the averages come from</h2>
   <div class="panel">
     <table>
@@ -179,8 +180,6 @@
       cancel out one huge warm prompt. 51 / 99 / 40 averages to 63%, but the real number of cached
       tokens is 41,186 of 72,947 — <b>56%</b>. The mod reports 56%.</div>
   </div>
-
-  <!-- ================= 4. TOTAL TOKENS ================= -->
   <h2>4 · total tokens — requests <em>and</em> sub-agents</h2>
   <div class="panel">
     <div class="tokbar">
@@ -195,8 +194,6 @@
       the total — but its TTFT, TPS and duration stay out of the averages, because those are approximate
       for a child (next section).</p>
   </div>
-
-  <!-- ================= 5. WHERE IT SHOWS ================= -->
   <h2>5 · Where the numbers appear on screen</h2>
 
   <div class="panel">
@@ -239,8 +236,6 @@
       <div><span class="g">✓</span> <b>⑂general</b> <span class="d">run tests</span> <span class="g">TTFT 1.7s</span> ⏱ 3.9s <span class="d">20k tok</span> <span class="m">9.3k t/s</span> <span class="d">1 tool call</span></div>
     </div>
   </div>
-
-  <!-- ================= 6. THE APPROXIMATION ================= -->
   <h2>6 · The one approximation, stated plainly</h2>
   <div class="grid2">
     <div class="panel">
@@ -265,7 +260,7 @@
 
   <p class="cap" style="margin-top:38px">
     Files: <code>status-metrics.ts</code> (<code>sessionAverages()</code>, <code>below-editor</code> widget) ·
-    <code>tests/metrics.test.ts</code> (45 tests) · <code>README.md</code>
+    <code>tests/metrics.test.ts</code> (51 tests) · <code>README.md</code>
   </p>
 
 </div>

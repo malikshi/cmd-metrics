@@ -1,3 +1,9 @@
+// metrics.test.ts — unit tests for the mod's formatters, aggregates, render paths and persistence.
+//
+// exports: none
+// used_by: none
+// rules:   Date.now is frozen to a controllable clock; a harness sharing one store Map simulates a reload or restart. Assertions check rendered text, never internal state.
+// agent:   claude-sonnet-4 | anthropic | 2026-11-02 | code-review | added boundary and resilience regressions, dropped dead helpers, added the L1 header
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -14,25 +20,21 @@ const {
 	sessionAverages,
 } = await import('../status-metrics.ts');
 
-function createHarness(sharedStore?: Map<string, unknown>) {
+function createHarness(
+	sharedStore?: Map<string, unknown>,
+	options: {failWrites?: boolean} = {},
+) {
 	const handlers = new Map<string, Array<(event: any) => void>>();
 	const overrides = new Map<string, (props: any, next?: () => any) => any>();
 	const panes = new Map<string, any>();
 	const widgets: Array<{placement: string; render: () => any[]}> = [];
 	const commands = new Map<string, any>();
 	const notices: string[] = [];
-	let widgetRefreshes = 0;
-	// Stands in for ~/.commandcode/mods/.store/status-metrics.json. Passing the same Map to a
-	// second harness is how a test simulates a hot reload or a full restart: the new module
-	// instance starts with empty memory but the same file on disk.
+	// Stands in for the on-disk store file.
+	// Rules:   passing the same Map to a second harness simulates a reload — new module memory, same file.
 	const store = sharedStore ?? new Map<string, unknown>();
 	let storeInFlight = 0;
 	let storeOverlaps = 0;
-
-	const record = (id: string, data: any) => {
-		const history = ((createHarness as any).sessions ??= new Map()).get(id) ?? [];
-		history.push(data);
-	};
 
 	const cmd: any = {
 		on: (type: string, handler: (event: any) => void) => {
@@ -76,16 +78,14 @@ function createHarness(sharedStore?: Map<string, unknown>) {
 				get: (key: string) => values.get(key),
 				set: (key: string, value: unknown) => {
 					values.set(key, value);
-					widgetRefreshes += 1;
 				},
 			};
 		})(),
 		store: {
 			get: (key: string) => store.get(key),
-			// Mirrors the host: each set is a whole-file read-modify-write that yields before it
-			// lands, so overlapping writes would interleave. `storeOverlaps` counts how often a
-			// write started while another was still in flight.
+			// Rules:   each set is a whole-file read-modify-write that yields before landing, so overlapping writes would interleave; storeOverlaps counts them.
 			set: async (key: string, value: unknown) => {
+				if (options.failWrites) throw new Error('store unavailable');
 				if (storeInFlight > 0) storeOverlaps += 1;
 				storeInFlight += 1;
 				await new Promise(resolve => setTimeout(resolve, 0));
@@ -93,6 +93,7 @@ function createHarness(sharedStore?: Map<string, unknown>) {
 				storeInFlight -= 1;
 			},
 			delete: async (key: string) => {
+				if (options.failWrites) throw new Error('store unavailable');
 				if (storeInFlight > 0) storeOverlaps += 1;
 				storeInFlight += 1;
 				await new Promise(resolve => setTimeout(resolve, 0));
@@ -123,15 +124,11 @@ function createHarness(sharedStore?: Map<string, unknown>) {
 			const widget = widgets.find(entry => entry.placement === placement);
 			return widget ? widget.render() : [];
 		},
-		get widgetRefreshes() {
-			return widgetRefreshes;
-		},
 		get storeOverlaps() {
 			return storeOverlaps;
 		},
 		openedPane: () => (createHarness as any).openedPane,
 		hooks: () => (createHarness as any).hooks,
-		record,
 	};
 }
 
@@ -140,8 +137,8 @@ const flat = (nodes: any[]): string =>
 		.map(node => (node.children ? flat(node.children) : (node.text ?? '')))
 		.join(' | ');
 
-// Saves are queued behind one another and each hop yields, so a test drains the chain by
-// letting every pending microtask and timer callback run before asserting on the store.
+// Drain the queued store writes before asserting on the store.
+// Rules:   each hop yields, so run every pending microtask and timer callback.
 const flushWrites = async (): Promise<void> => {
 	for (let index = 0; index < 10; index += 1) {
 		await new Promise(resolve => setTimeout(resolve, 0));
@@ -608,6 +605,8 @@ test('/metrics summary reports average duration and total tokens', () => {
 
 test('formatTokens rolls over at the k boundary instead of printing 1000k', () => {
 	assert.equal(formatTokens(999_499), '999k');
+	// Rules:   999,949 rounds inside k to 1000, so it rolls to 1.0M rather than read 1000k.
+	assert.equal(formatTokens(999_949), '1.0M');
 	assert.equal(formatTokens(999_999), '1.0M');
 	assert.equal(formatTokens(1_000_000), '1.0M');
 });
@@ -632,7 +631,7 @@ test('a request that never streamed a token reports no TTFT and no TPS', () => {
 	h.emit('model_request_end', {usage: {inputTokens: 900, outputTokens: 0}});
 
 	const paneText = flat(h.pane());
-	// Duration is still real, but TTFT must not be the duration dressed up as a measurement.
+	// Rules:   duration is still real, but TTFT must never be the duration dressed up as a measurement.
 	assert.match(paneText, /TTFT —/);
 	assert.match(paneText, /⏱ 2\.0s/);
 
@@ -847,4 +846,74 @@ test('sub-agents survive a reload with the session', async () => {
 	assert.match(text, /⑂explore/);
 	assert.match(text, /20k tok/);
 	assert.match(reloaded.command().message, /1 sub-agent/);
+});
+
+test('formatTokens never prints a bare 1000 at the k boundary', () => {
+	// 999.6 would round to 1000, which is neither "1.0k" nor a valid bare count.
+	assert.equal(formatTokens(999.6), '1.0k');
+	assert.equal(formatTokens(999.4), '999');
+	// The k unit itself must not print a trailing ".0" past the 10k boundary.
+	assert.equal(formatTokens(9_999), '10k');
+	assert.equal(formatTokens(10_000), '10k');
+});
+
+test('formatPercent never prints 10.0% at the boundary', () => {
+	// 9.96 rounds to 10.0, which must collapse to the same shape as an exact 10.
+	assert.equal(formatPercent(9.96), '10%');
+	assert.equal(formatPercent(9.99), '10%');
+	assert.equal(formatPercent(10), '10%');
+	assert.equal(formatPercent(9.94), '9.9%');
+});
+
+test('session cache rate is clamped like the per-request rate', () => {
+	// cacheReadTokens exceeding inputTokens is nonsense; the row clamps to 100, so must the aggregate.
+	const stats = sessionAverages([{inputTokens: 1_000, cacheReadTokens: 2_000}]);
+	assert.equal(stats.cachePercent, 100);
+});
+
+test('run_end without model_request_end drops the phantom live request', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/one'});
+	advance(400);
+	h.emit('text_delta', {delta: 'x'});
+	advance(600);
+	// The request is cancelled: no model_request_end ever arrives.
+	h.emit('run_end', {});
+
+	// No live row, and the spinner must not claim a running request forever.
+	assert.doesNotMatch(flat(h.pane()), /▶/);
+	assert.doesNotMatch(flat(h.spinner(0)), /TTFT 0\.40s/);
+});
+
+test('a failing store write does not crash the mod or lose the in-memory figures', async () => {
+	const h = createHarness(new Map(), {failWrites: true});
+	h.hooks().onSessionStart({source: 'startup', sessionId: 'sess-fail'});
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/one'});
+	advance(100);
+	h.emit('text_delta', {delta: 'x'});
+	h.emit('model_request_end', {usage: {outputTokens: 5}});
+	await flushWrites();
+
+	// The write was rejected, but the session figures are still in memory and still render.
+	assert.match(h.command().message, /1 request/);
+});
+
+test('a malformed stored session does not crash the restore', () => {
+	const store = new Map<string, unknown>();
+	store.set('session:sess-bad', {
+		requests: [null, {model: 'm/one'}],
+		// A partial child row: only the id, none of the fields a render reads directly.
+		subagents: [null, {toolCallId: 'c1'}],
+	});
+	const h = createHarness(store);
+	h.hooks().onSessionStart({source: 'reload', sessionId: 'sess-bad'});
+
+	// The corrupt rows are skipped or normalised rather than crashing a render.
+	const text = flat(h.pane());
+	assert.match(flat(h.widget()), /session/);
+	assert.match(h.command().message, /request/);
+	assert.match(text, /⑂agent/);
+	assert.match(text, /0 tool call/);
 });

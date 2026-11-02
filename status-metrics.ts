@@ -1,6 +1,9 @@
-// status-metrics — per-request TPS, TTFT, duration and prompt-cache hit rate on the
-// spinner line, the same numbers for every spawned sub-agent, and a /metrics pane with
-// the request history.
+// status-metrics.ts — per-request TPS, TTFT, duration and cache metrics plus a /metrics pane.
+//
+// exports: default | SessionAverages | tpsText | formatDuration | formatTokens | formatRate | formatPercent | cachePercent | parseUsageBlock | modelLabel | sessionAverages
+// used_by: tests/metrics.test.ts → formatters, sessionAverages, parseUsageBlock, modelLabel, default
+// rules:   Every figure comes from the public mod API; no Command Code internals are patched. A request with no observed first token reports no TTFT and no TPS. Store writes are serialized through one chain.
+// agent:   claude-sonnet-4 | anthropic | 2026-11-02 | code-review | fixed k/M and percent boundary rounding, clamped the session cache rate, cleared phantom live state on run_end, hardened restore against malformed rows, surfaced store write failures, and completed CodeDNA headers
 
 import type {ModApi} from '@commandcode/harness';
 
@@ -78,9 +81,8 @@ interface SubagentMetric {
 	toolCalls?: number;
 }
 
-// What cmd.store keeps in ~/.commandcode/mods/.store/status-metrics.json. The sessionId is the
-// whole point: a hot reload and a /reload restart both hand the mod the same session again, so
-// the stored figures are restored instead of a blank line; a different session overwrites them.
+// The stored shape of one session, keyed by suite sessionId.
+// Rules:   A reload and a restart hand the same sessionId, so figures are restored; another session starts from zero.
 interface PersistedSession {
 	sessionId?: string;
 	requests: RequestRecord[];
@@ -141,29 +143,36 @@ export function formatDuration(ms: number | undefined): string {
 	return minutes > 0 ? `${minutes}m${String(seconds).padStart(2, '0')}s` : `${seconds}s`;
 }
 
+// One shared magnitude formatter, so tokens and rates never disagree at a unit boundary.
+// Rules: round inside the unit before choosing it — 999.6 reads 1.0k and 9,999 reads 10k, never
+// a bare 1000 or 10.0k; 999,999 reads 1.0M, never 1000k. Rates keep one decimal in k (12.4k);
+// tokens drop it from 10k up (12k), which is the documented shape.
+const formatMagnitude = (value: number, isRate: boolean): string => {
+	if (value < TOKENS_PER_K) return String(value);
+	const thousands = isRate
+		? Math.round(value / 100) / 10
+		: value < 10 * TOKENS_PER_K
+			? Math.round(value / 100) / 10
+			: Math.round(value / TOKENS_PER_K);
+	// Rules:   roll to M when the rounded k value reaches 1000, so 999,949 reads 1.0M, never 999.9k+1.
+	if (thousands >= TOKENS_PER_K) return `${(value / TOKENS_PER_M).toFixed(1)}M`;
+	if (isRate || thousands < 10) return `${thousands.toFixed(1)}k`;
+	return `${thousands}k`;
+};
+
 export function formatTokens(tokens: number): string {
 	if (!Number.isFinite(tokens) || tokens <= 0) return '0';
-	if (tokens < TOKENS_PER_K) return String(Math.round(tokens));
-	// Round inside the k unit first: 999,999 must read 1.0M, never 1000k.
-	const thousands = tokens / TOKENS_PER_K;
-	if (Math.round(thousands) < TOKENS_PER_K) {
-		return `${thousands < 10 ? thousands.toFixed(1) : Math.round(thousands)}k`;
-	}
-	return `${(tokens / TOKENS_PER_M).toFixed(1)}M`;
+	return formatMagnitude(Math.round(tokens), false);
 }
 
 export function formatRate(tps: number | undefined): string {
 	if (tps === undefined || !Number.isFinite(tps) || tps <= 0) return '—';
 	const rounded = tps >= 10 ? Math.round(tps) : Math.round(tps * 10) / 10;
-	// Decide on the rounded value so 999.7 reports 1.0k t/s, not 1000 t/s.
-	if (rounded < TOKENS_PER_K) return `${rounded} t/s`;
-	return `${(tps / TOKENS_PER_K).toFixed(1)}k t/s`;
+	return `${formatMagnitude(rounded, true)} t/s`;
 }
 
-// inputTokens counts the whole prompt, cache reads AND cache writes included: the cost
-// estimate subtracts both back out before pricing uncached input. So the cache hit rate is
-// cacheReadTokens ÷ inputTokens, and a cache write is not a hit but the write is still a
-// portion of the prompt that never had to be billed as fresh input.
+// Cache hit rate for one usage block.
+// Rules:   inputTokens already counts cached tokens, so divide cacheReadTokens by it directly; clamp at 100 and return undefined for a non-positive or non-finite prompt.
 export function cachePercent(usage: Usage | undefined): number | undefined {
 	const inputTokens = Number(usage?.inputTokens ?? 0);
 	if (!Number.isFinite(inputTokens) || inputTokens <= 0) return undefined;
@@ -175,18 +184,17 @@ export function cachePercent(usage: Usage | undefined): number | undefined {
 
 export function formatPercent(percent: number | undefined): string {
 	if (percent === undefined || !Number.isFinite(percent)) return '—';
-	if (percent > 0 && percent < 10) return `${percent.toFixed(1)}%`;
-	return `${Math.round(percent)}%`;
+	// Rules:   round before choosing the shape, so 9.96 reads 10% like an exact 10, never 10.0%.
+	const rounded = percent > 0 && percent < 10 ? Math.round(percent * 10) / 10 : Math.round(percent);
+	if (rounded > 0 && rounded < 10) return `${rounded.toFixed(1)}%`;
+	return `${Math.round(rounded)}%`;
 }
 
 const averageOf = (values: number[]): number | undefined =>
 	values.length === 0 ? undefined : values.reduce((sum, value) => sum + value, 0) / values.length;
 
-// Session aggregates. TTFT, TPS and duration average the parent model requests only, so the
-// approximate sub-agent TTFT (spawn → first forwarded event) cannot dilute a measured one.
-// The cache rate is token-weighted and request-only; a child carries no prompt accounting.
-// totalTokens sums every usage figure seen in the session, parent requests and sub-agents
-// alike, because each is its own inference call billed on its own tokens.
+// Session aggregates for the widget, the pane and the /metrics summary.
+// Rules:   TTFT, TPS, duration and cache average parent requests only; the approximate child TTFT never dilutes them. Cache is token-weighted and clamped at 100. totalTokens sums parent and child usage.
 export function sessionAverages(
 	requests: RequestMetric[],
 	subagents: SubagentMetric[] = [],
@@ -220,10 +228,9 @@ export function sessionAverages(
 			.filter((duration): duration is number => duration !== undefined),
 	);
 	if (avgDurationMs !== undefined) averages.avgDurationMs = avgDurationMs;
-	if (totalInput > 0) averages.cachePercent = (totalCacheRead / totalInput) * 100;
+	if (totalInput > 0) averages.cachePercent = Math.min(100, (totalCacheRead / totalInput) * 100);
 
-	// Sub-agent figures are derived from the same stored records, each already finalised. They
-	// stay in their own fields so a parent average and a child average are never confused.
+	// Rules:   child figures keep their own fields so a parent average is never confused for a child one.
 	const definedOnly = (values: (number | undefined)[]): number[] =>
 		values.filter((value): value is number => value !== undefined);
 	const subagentTtft = averageOf(definedOnly(subagents.map(subagent => subagent.ttftMs)));
@@ -282,9 +289,8 @@ function resultText(result: unknown): string {
 
 export default function (cmd: ModApi): void {
 	let current: RequestRecord | undefined;
-	// Every request of the session is kept: the session figures are contractually session-wide,
-	// and shifting the array at 50 would silently turn them into a trailing window. Only the
-	// pane caps what it draws.
+	// Every request of the session is kept: the figures are session-wide.
+	// Rules:   never shift history at a cap — that turns session totals into a trailing window; only the pane caps its rows.
 	let history: RequestRecord[] = [];
 	let sessionId: string | undefined;
 	const subagents = new Map<string, SubagentRecord>();
@@ -303,28 +309,49 @@ export default function (cmd: ModApi): void {
 		resetRate();
 	};
 
-	// cmd.store is synchronous on read: the host loads the file before the factory runs. Every
-	// session is kept under its own key, so resuming an older session restores its own figures
-	// instead of adopting whichever session happened to be the most recent.
+	// Restore one session's figures from the synchronous store read.
+	// Rules:   each session has its own key, so an older session restores itself, not the latest. The file is user-editable, so skip any row without the fields a render needs instead of crashing.
+	const isRecord = (value: unknown): value is Record<string, unknown> =>
+		typeof value === 'object' && value !== null;
 	const restore = (id: string | undefined): void => {
 		if (id === undefined) return;
 		const stored = cmd.store.get<PersistedSession>(sessionKey(id));
-		if (!stored) return;
-		history = Array.isArray(stored.requests) ? stored.requests : [];
+		if (!isRecord(stored)) return;
+		const requests = Array.isArray(stored.requests) ? stored.requests : [];
+		history = requests.filter(
+			(record): record is RequestRecord => isRecord(record) && typeof record.model === 'string',
+		);
 		subagents.clear();
 		for (const subagent of Array.isArray(stored.subagents) ? stored.subagents : []) {
-			subagents.set(subagent.toolCallId, subagent);
+			if (!isRecord(subagent) || typeof subagent.toolCallId !== 'string') continue;
+			const record = subagent as unknown as SubagentRecord;
+			// Rules:   fill the fields a render reads directly, since formatDuration/formatRate tolerate undefined but the raw text and arithmetic do not.
+			if (typeof record.type !== 'string') record.type = 'agent';
+			if (typeof record.description !== 'string') record.description = '';
+			if (typeof record.toolCalls !== 'number') record.toolCalls = 0;
+			if (typeof record.tokens !== 'number') record.tokens = 0;
+			if (typeof record.startedAt !== 'number') record.startedAt = 0;
+			subagents.set(record.toolCallId, record);
 		}
 	};
 
-	// cmd.store.set rewrites the WHOLE store file (read-modify-write, no lock, not atomic), and
-	// the host does not await session hooks, so two unsequenced writes interleave and corrupt
-	// the JSON. A parse failure then makes the host drop every stored session silently. Every
-	// write therefore goes through one promise chain: a save is queued behind the previous one
-	// and the file is only ever rewritten by a single writer at a time.
+	// Single-writer promise chain around cmd.store.set.
+	// Rules:   cmd.store.set rewrites the whole file with no lock and the host does not await session hooks, so unsequenced writes interleave and corrupt the JSON — every write goes through this one chain. A failure surfaces once as a warning and never crashes the mod.
 	let writes: Promise<void> = Promise.resolve();
+	let isWriteFailing = false;
 	const enqueueWrite = (write: () => Promise<void>): void => {
-		writes = writes.then(write, write).catch(() => {});
+		writes = writes
+			.then(write, write)
+			.then(
+				() => {
+					isWriteFailing = false;
+				},
+				() => {
+					// Rules:   notify on the first failure only — one broken store must not spam.
+					if (!isWriteFailing) cmd.ui.notify('metrics: could not save session figures', 'warning');
+					isWriteFailing = true;
+				},
+			);
 	};
 
 	const save = (id: string | undefined): void => {
@@ -378,7 +405,7 @@ export default function (cmd: ModApi): void {
 
 		const rate = delta / (windowMs / 1_000);
 		if (!Number.isFinite(rate) || rate <= 0 || rate > TPS_MAX) {
-			// A counter jump, not generation: start over without a rate.
+			// Rules:   a counter jump is not generation — start the window over without a rate.
 			samples = [{at: now, tokens}];
 			smoothed = undefined;
 			lastTokenAt = now;
@@ -799,8 +826,8 @@ export default function (cmd: ModApi): void {
 		repaint();
 	});
 
-	// Finalises TTFT and TPS once a child is done. TTFT is the first forwarded child event;
-	// a child that never emitted one is measured from spawn (its whole wait is prefill).
+	// Finalise a finished child's duration, TTFT and TPS.
+	// Rules:   TTFT is the first forwarded child event; a child that never emitted one is measured from spawn, so its whole wait reads as prefill.
 	const finalizeSubagent = (subagent: SubagentRecord): void => {
 		if (subagent.endedAt === undefined) return;
 		const durationMs =
@@ -836,8 +863,7 @@ export default function (cmd: ModApi): void {
 		const usage = parseUsageBlock(resultText(payload.result));
 		if (usage.durationMs !== undefined) subagent.durationMs = usage.durationMs;
 		if (usage.totalTokens !== undefined) subagent.tokensUsed = usage.totalTokens;
-		// Without a usage block there is no duration to trust: leave the child running and let
-		// subagent_stop close it, instead of ending it at zero elapsed time.
+		// Rules:   with no usage block there is no duration to trust — leave the child running and let subagent_stop close it, never end it at zero elapsed time.
 		if (subagent.durationMs !== undefined) {
 			subagent.endedAt ??= subagent.startedAt + subagent.durationMs;
 		}
@@ -846,13 +872,13 @@ export default function (cmd: ModApi): void {
 	});
 
 	cmd.on('run_end', () => {
+		// A cancelled or failed request never emits model_request_end, so the live state must be
+		// dropped here or the spinner reports a phantom request forever.
+		reset();
 		if (history.length > 0) cmd.ui.notify(summaryLine());
 	});
 
-	// A hot reload and a /reload restart both arrive as onSessionStart with the SAME sessionId,
-	// so the stored figures are restored rather than wiped: a reload re-runs this factory, which
-	// means the in-memory history is gone and cmd.store is the only source. restore() adopts the
-	// figures only when the stored id matches, so a different or older session starts from zero.
+	// Rules:   a hot reload and a /reload restart both arrive with the same sessionId, so restore the stored figures instead of wiping them — the factory re-runs and memory is gone, so cmd.store is the only source. A different or older session starts from zero.
 	cmd.hooks({
 		onSessionStart: ({sessionId: next}) => {
 			reset();

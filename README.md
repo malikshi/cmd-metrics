@@ -142,7 +142,7 @@ implying token-level precision. Its duration, token count and TPS are exact.
 ## Development
 
 ```bash
-npm test        # 45 unit tests, no build step (node --experimental-strip-types)
+npm test        # 51 unit tests, no build step (node --experimental-strip-types)
 npm run typecheck
 ```
 
