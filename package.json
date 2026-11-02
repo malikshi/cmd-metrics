@@ -1,0 +1,25 @@
+{
+	"name": "cmd-metrics",
+	"version": "1.0.0",
+	"description": "Per-request TPS, TTFT, duration and prompt-cache hit rate for Command Code, including every spawned sub-agent.",
+	"keywords": [
+		"cmd-mod",
+		"cmd-mod-hook",
+		"cmd-mod-command",
+		"metrics",
+		"observability"
+	],
+	"license": "MIT",
+	"type": "module",
+	"repository": "https://github.com/malikshi/cmd-metrics",
+	"commandcode": {
+		"mods": ["./status-metrics.ts"]
+	},
+	"scripts": {
+		"test": "node --experimental-strip-types --test tests/metrics.test.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"typescript": "^5.6.0"
+	}
+}
