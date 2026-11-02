@@ -74,6 +74,24 @@ Sub-agents
 rate is **token-weighted** (`ΣcacheRead ÷ Σinput`), not an average of per-request percentages,
 so a small cold request cannot cancel out a large warm prompt.
 
+## Terminal width
+
+Command Code renders mod widgets and panes with `wrap: 'truncate'`, so text that does not fit is
+cut off rather than reflowed. A docked pane is only 40–72 cells wide (`modPaneDock` gives it 40%
+of the width, clamped; below 140 columns it is not docked at all), so `/metrics` renders against
+the width it is handed and keeps only the fields that fit:
+
+| Width | Request row | Sub-agent row |
+|---|---|---|
+| ≥ 66 | all fields, incl. cache %, t/s and stop reason | all fields, incl. description, t/s and tool calls |
+| ≥ 54 | drops cache % and stop reason | drops t/s and description |
+| ≥ 40 | model, duration, tokens, t/s | type, TTFT, duration, tokens |
+| < 40 | model and duration only | type, duration, tokens |
+
+Legend lines shorten with the same tiers. The below-editor line keeps `session · t/s · total tok`
+everywhere, and adds TTFT, avg duration and cache % once there is room for them. Resizing
+repaints both surfaces at the new width.
+
 ## How metrics are measured
 
 Everything comes from the public mod API — no patching of Command Code internals.

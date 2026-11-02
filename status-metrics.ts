@@ -12,6 +12,12 @@ const TPS_SMOOTHING = 0.25;
 const HISTORY_LIMIT = 50;
 const SPINNER_SUBAGENTS = 3;
 const PANE_ID = 'metrics';
+// A docked pane is 40–72 cells wide and an undocked one shares the prompt column; the CLI
+// truncates whatever does not fit, so each row decides which fields to keep for the width.
+const DETAIL_FULL_WIDTH = 66;
+const DETAIL_WIDE_WIDTH = 54;
+const DETAIL_MID_WIDTH = 40;
+const SUBAGENT_DESCRIPTION_MAX = 40;
 
 interface Usage {
 	inputTokens?: number;
@@ -219,6 +225,20 @@ export function modelLabel(model: string): string {
 	return tail.length > 0 ? tail : model;
 }
 
+type Detail = 'full' | 'wide' | 'mid' | 'narrow';
+
+export function detailFor(width: number): Detail {
+	if (width >= DETAIL_FULL_WIDTH) return 'full';
+	if (width >= DETAIL_WIDE_WIDTH) return 'wide';
+	if (width >= DETAIL_MID_WIDTH) return 'mid';
+	return 'narrow';
+}
+
+export function truncate(text: string, max: number): string {
+	if (max <= 0) return '';
+	return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
 function resultText(result: unknown): string {
 	if (typeof result === 'string') return result;
 	if (!Array.isArray(result)) return '';
@@ -382,28 +402,35 @@ export default function (cmd: ModApi): void {
 		return parts.join(' · ');
 	};
 
-	const avgWidgetLines = (): Line[] => {
+	const avgWidgetLines = (width: number): Line[] => {
 		if (history.length === 0) return [];
+		const detail = detailFor(width);
 		const stats = sessionAverages(history, [...subagents.values()]);
 		const nodes: TextNode[] = [{type: 'text', text: 'session', dim: true}];
-		if (stats.avgTtftMs !== undefined)
+		if (detail === 'full' && stats.avgTtftMs !== undefined)
 			nodes.push({type: 'text', text: `TTFT ${formatDuration(stats.avgTtftMs)}`, color: 'green'});
 		if (stats.avgTps !== undefined)
 			nodes.push({type: 'text', text: formatRate(stats.avgTps), color: 'cyan'});
-		if (stats.avgDurationMs !== undefined)
+		if (detail !== 'narrow' && stats.avgDurationMs !== undefined)
 			nodes.push({type: 'text', text: `⏱ ${formatDuration(stats.avgDurationMs)}`, color: 'white'});
-		if (stats.cachePercent !== undefined)
+		if (detail === 'full' && stats.cachePercent !== undefined)
 			nodes.push({type: 'text', text: `cache ${formatPercent(stats.cachePercent)}`, color: 'yellow'});
 		nodes.push({type: 'text', text: `${formatTokens(stats.totalTokens)} tok`, color: 'magenta'});
 		return [{type: 'row', children: nodes}];
 	};
 
-	const requestLines = (): Line[] => {
+	const requestLines = (width: number): Line[] => {
+		const detail = detailFor(width);
 		const lines: Line[] = [
 			{type: 'text', text: 'Requests', bold: true},
 			{
 				type: 'text',
-				text: 'TTFT = first streamed token · duration = model request wall time · t/s = output tokens ÷ generation time',
+				text:
+					detail === 'full'
+						? 'TTFT = first streamed token · duration = model request wall time · t/s = output tokens ÷ generation time'
+						: detail === 'narrow'
+							? 'TTFT · t/s = output ÷ generation'
+							: 'TTFT = first streamed token · t/s = output ÷ generation',
 				dim: true,
 			},
 		];
@@ -427,31 +454,40 @@ export default function (cmd: ModApi): void {
 			lines.push({type: 'text', text: 'no model requests yet in this run', dim: true});
 		}
 		for (const [index, record] of history.entries()) {
-			lines.push({
-				type: 'row',
-				children: [
-					{type: 'text', text: `#${index + 1}`, dim: true},
-					{type: 'text', text: modelLabel(record.model)},
-					{type: 'text', text: `TTFT ${formatDuration(record.ttftMs ?? 0)}`, color: 'green'},
-					{type: 'text', text: `⏱ ${formatDuration(record.durationMs ?? 0)}`},
-					{type: 'text', text: `${formatTokens(record.outputTokens ?? 0)} tok`, dim: true},
-					{type: 'text', text: `cache ${formatPercent(record.cachePercent)}`, color: 'yellow'},
-					{type: 'text', text: formatRate(record.tps), color: 'cyan'},
-					...(record.stopReason ? [{type: 'text' as const, text: record.stopReason, dim: true}] : []),
-				],
-			});
+			const children: TextNode[] = [
+				{type: 'text', text: `#${index + 1}`, dim: true},
+				{type: 'text', text: modelLabel(record.model)},
+			];
+			// Each tier keeps the fields that fit: a docked pane is 40–72 cells, and the CLI
+			// truncates rather than wraps, so a dropped field beats a cut-off one.
+			if (detail === 'full')
+				children.push({type: 'text', text: `TTFT ${formatDuration(record.ttftMs ?? 0)}`, color: 'green'});
+			children.push({type: 'text', text: `⏱ ${formatDuration(record.durationMs ?? 0)}`});
+			if (detail === 'full' || detail === 'wide')
+				children.push({type: 'text', text: `${formatTokens(record.outputTokens ?? 0)} tok`, dim: true});
+			if (detail === 'full')
+				children.push({type: 'text', text: `cache ${formatPercent(record.cachePercent)}`, color: 'yellow'});
+			if (detail !== 'narrow')
+				children.push({type: 'text', text: formatRate(record.tps), color: 'cyan'});
+			if (detail === 'full' && record.stopReason)
+				children.push({type: 'text', text: record.stopReason, dim: true});
+			lines.push({type: 'row', children});
 		}
 		return lines;
 	};
 
-	const subagentLines = (): Line[] => {
+	const subagentLines = (width: number): Line[] => {
 		if (subagents.size === 0) return [];
+		const detail = detailFor(width);
 		const now = Date.now();
 		const lines: Line[] = [
 			{type: 'text', text: 'Sub-agents', bold: true},
 			{
 				type: 'text',
-				text: 'TTFT = spawn → first child activity (the harness forwards no child token deltas) · t/s = tokens ÷ (duration − TTFT)',
+				text:
+					detail === 'full'
+						? 'TTFT = spawn → first child activity (the harness forwards no child token deltas) · t/s = tokens ÷ (duration − TTFT)'
+						: 'TTFT = spawn → first child activity · t/s = tokens ÷ (duration − TTFT)',
 				dim: true,
 			},
 		];
@@ -462,39 +498,38 @@ export default function (cmd: ModApi): void {
 			const elapsedMs =
 				subagent.durationMs ??
 				(subagent.endedAt ?? subagent.lastActivityAt ?? now) - subagent.startedAt;
-			lines.push({
-				type: 'row',
-				children: [
-					{type: 'text', text: running ? '▶' : '✓', color: running ? 'magenta' : 'green'},
-					{type: 'text', text: `⑂${subagent.type}`, bold: true},
-					{type: 'text', text: subagent.description, dim: true},
-					{
-						type: 'text',
-						text: ttft === undefined ? 'TTFT —' : `TTFT ${formatDuration(ttft)}`,
-						color: 'green',
-					},
-					{
-						type: 'text',
-						text: `⏱ ${formatDuration(elapsedMs)}`,
-					},
-					{
-						type: 'text',
-						text: `${formatTokens(subagent.tokensUsed ?? subagent.tokens)} tok`,
-						dim: true,
-					},
-					{
-						type: 'text',
-						text: rate === undefined ? '—' : formatRate(rate),
-						color: 'magenta',
-					},
-					{
-						type: 'text',
-						text: `${subagent.toolCalls} tool call(s)`,
-						dim: true,
-					},
-					...(subagent.status ? [{type: 'text' as const, text: subagent.status, dim: true}] : []),
-				],
+			const children: TextNode[] = [
+				{type: 'text', text: running ? '▶' : '✓', color: running ? 'magenta' : 'green'},
+				{type: 'text', text: `⑂${subagent.type}`, bold: true},
+			];
+			if (detail === 'full' && subagent.description)
+				children.push({type: 'text', text: truncate(subagent.description, SUBAGENT_DESCRIPTION_MAX), dim: true});
+			if (detail !== 'narrow')
+				children.push({
+					type: 'text',
+					text: ttft === undefined ? 'TTFT —' : `TTFT ${formatDuration(ttft)}`,
+					color: 'green',
+				});
+			children.push({type: 'text', text: `⏱ ${formatDuration(elapsedMs)}`});
+			children.push({
+				type: 'text',
+				text: `${formatTokens(subagent.tokensUsed ?? subagent.tokens)} tok`,
+				dim: true,
 			});
+			if (detail === 'full')
+				children.push({
+					type: 'text',
+					text: rate === undefined ? '—' : formatRate(rate),
+					color: 'magenta',
+				});
+			if (detail === 'full' || detail === 'wide')
+				children.push({
+					type: 'text',
+					text: `${subagent.toolCalls} tool call(s)`,
+					dim: true,
+				});
+			if (subagent.status) children.push({type: 'text', text: subagent.status, dim: true});
+			lines.push({type: 'row', children});
 		}
 		return lines;
 	};
@@ -513,15 +548,15 @@ export default function (cmd: ModApi): void {
 
 	cmd.ui.widget({
 		placement: 'below-editor',
-		render: () => avgWidgetLines(),
+		render: avgWidgetLines,
 	});
 
 	cmd.ui.pane({
 		id: PANE_ID,
 		title: 'Request metrics',
-		render: () => {
-			const lines: Line[] = [...requestLines()];
-			const subagentSection = subagentLines();
+		render: width => {
+			const lines: Line[] = [...requestLines(width)];
+			const subagentSection = subagentLines(width);
 			if (subagentSection.length > 0) lines.push({type: 'text', text: ''}, ...subagentSection);
 			lines.push(
 				{type: 'text', text: ''},
