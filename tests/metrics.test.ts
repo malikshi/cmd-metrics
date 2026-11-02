@@ -1201,32 +1201,47 @@ test('a host without ui.capabilities still serves /metrics as text', () => {
 	assert.match(h.command().message, /1 request/);
 });
 
-test('a queued save captures a copy, not the live records it was scheduled with', async () => {
+test('a persisted snapshot is a copy, so later mutation cannot rewrite the file', async () => {
 	const store = new Map<string, unknown>();
 	const h = createHarness(store);
 	h.hooks().onSessionStart({source: 'startup', sessionId: 'sess-copy'});
 	h.emit('run_start');
 	h.emit('subagent_start', {toolCallId: 'c1', subagentType: 'explore', description: 'find'});
 	advance(500);
-	// subagent_stop schedules the write, then progress mutates the same record in the same tick.
-	h.emit('subagent_stop', {toolCallId: 'c1', tokensUsed: 100});
-	h.emit('subagent_progress', {toolCallId: 'c1', tokensUsed: 99_999});
-	// A request completing in the same tick must not reach the snapshot already scheduled.
-	h.emit('model_request_start', {model: 'm/late'});
+	h.emit('subagent_progress', {toolCallId: 'c1', tokensUsed: 1_000, toolName: 'grep'});
+	// The request end schedules the write; the copy is taken when it drains.
+	h.emit('model_request_start', {model: 'm/one'});
 	advance(100);
 	h.emit('text_delta', {delta: 'x'});
 	h.emit('model_request_end', {usage: {outputTokens: 5}});
 	await flushWrites();
 
-	const firstWrite = h.writes.find(entry => entry.key === 'session:sess-copy')!;
-	// subagent_stop set tokensUsed=100 on the record before scheduling; the later progress event
-	// (tokens = 99,999) mutates the live object, and must not be visible in that snapshot. With a
-	// stored reference this assertion reads 99,999.
-	assert.equal(firstWrite.value.subagents[0].tokens, 0);
-	assert.equal(firstWrite.value.subagents[0].tokensUsed, 100);
-	// The array itself is copied too: a request that lands after the write was scheduled must not
-	// appear in it. With the live array aliased this reads 1.
-	assert.equal(firstWrite.value.requests.length, 0);
+	const stored = store.get('session:sess-copy') as any;
+	assert.equal(stored.subagents[0].tokens, 1_000);
+	// Mutating the live record afterwards must not reach the already-written file. With a stored
+	// reference this reads 5,000 and the file silently disagrees with itself.
+	h.emit('subagent_progress', {toolCallId: 'c1', tokensUsed: 5_000, toolName: 'grep'});
+	assert.equal((store.get('session:sess-copy') as any).subagents[0].tokens, 1_000);
+});
+
+test('a burst of requests coalesces into one store write, not one per request', async () => {
+	const store = new Map<string, unknown>();
+	const h = createHarness(store);
+	h.hooks().onSessionStart({source: 'startup', sessionId: 'sess-burst'});
+	h.emit('run_start');
+	// Each store.set rewrites the whole file, so a long session must not write per event.
+	for (let index = 0; index < 5; index += 1) {
+		h.emit('model_request_start', {model: 'm/one'});
+		advance(100);
+		h.emit('text_delta', {delta: 'x'});
+		h.emit('model_request_end', {usage: {outputTokens: 5}});
+	}
+	await flushWrites();
+
+	const sessionWrites = h.writes.filter(entry => entry.key === 'session:sess-burst');
+	assert.equal(sessionWrites.length, 1);
+	// The one write still carries every request: coalescing drops writes, never data.
+	assert.equal((store.get('session:sess-burst') as any).requests.length, 5);
 });
 
 test('a failing store write does not crash the mod or lose the in-memory figures', async () => {

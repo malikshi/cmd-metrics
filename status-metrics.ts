@@ -380,17 +380,23 @@ export default function (cmd: ModApi): void {
 			);
 	};
 
+	// Rules: cmd.store.set rewrites the whole store file on every call, so writing once per request
+	// makes a long session O(n) whole-file rewrites. Coalesce instead: at most one write is queued,
+	// and it persists the state as of the moment it drains, so a burst costs one write rather than
+	// one per event. The snapshot is copied synchronously before the first await, so the array and
+	// its records can never be torn apart by a later mutation.
+	let saveQueued = false;
 	const save = (id: string | undefined): void => {
-		if (id === undefined) return;
-		const snapshot: PersistedSession = {
-			sessionId: id,
-			// Rules:   copy by value — the write is queued, and the live array/records keep being
-			// mutated by later events, so a reference would persist a state the mod never had.
-			requests: history.slice(),
-			subagents: [...subagents.values()].map(subagent => ({...subagent})),
-		};
+		if (id === undefined || saveQueued) return;
+		saveQueued = true;
 		const key = sessionKey(id);
 		enqueueWrite(async () => {
+			saveQueued = false;
+			const snapshot: PersistedSession = {
+				sessionId: id,
+				requests: history.slice(),
+				subagents: [...subagents.values()].map(subagent => ({...subagent})),
+			};
 			const known = cmd.store.get<string[]>(INDEX_KEY);
 			const ordered = [id, ...(Array.isArray(known) ? known.filter(entry => entry !== id) : [])];
 			await cmd.store.set(key, snapshot);
