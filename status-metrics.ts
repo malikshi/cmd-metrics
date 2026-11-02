@@ -315,9 +315,6 @@ export default function (cmd: ModApi): void {
 	let samples: {at: number; tokens: number}[] = [];
 	let smoothed: number | undefined;
 	let lastTokenAt = 0;
-	// A request interrupted before its usage event arrived. Kept so a late model_request_end can
-	// still record the row, while the live spinner state is already released.
-	let pendingEnd: RequestRecord | undefined;
 
 	const resetRate = (): void => {
 		samples = [];
@@ -327,7 +324,6 @@ export default function (cmd: ModApi): void {
 
 	const reset = (): void => {
 		current = undefined;
-		pendingEnd = undefined;
 		resetRate();
 	};
 
@@ -805,17 +801,16 @@ export default function (cmd: ModApi): void {
 	cmd.on('message_update', markFirstToken);
 
 	cmd.on('model_request_end', event => {
-		// Rules:   an aborted request keeps a pending record so its late usage still lands — the
-		// README promises an interrupted request counts in the totals and the cache rate.
-		const record0 = current ?? pendingEnd;
-		if (!record0) return;
+		if (!current) return;
 		const payload = event as {usage?: Usage; stopReason?: unknown};
 		const endedAt = Date.now();
-		const durationMs = endedAt - record0.startedAt;
+		const durationMs = endedAt - current.startedAt;
 		// A request whose first token was never observed has no TTFT. Recording the duration
 		// instead would turn prefill into a measured TTFT and drag the session average up.
 		const ttftMs =
-			record0.firstTokenAt === undefined ? undefined : record0.firstTokenAt - record0.startedAt;
+			current.firstTokenAt === undefined
+				? undefined
+				: current.firstTokenAt - current.startedAt;
 		const outputTokens = Number(payload.usage?.outputTokens ?? 0) || 0;
 		const generationMs = ttftMs === undefined ? undefined : durationMs - ttftMs;
 		// Rules:   a rate above TPS_MAX is not decoding — it is a flushed answer divided by the
@@ -836,7 +831,7 @@ export default function (cmd: ModApi): void {
 		const tps = rawTps !== undefined && rawTps <= TPS_MAX ? rawTps : undefined;
 		const isWallClockRate = wallClockRate && tps !== undefined;
 		const record: RequestRecord = {
-			...record0,
+			...current,
 			endedAt,
 			durationMs,
 			outputTokens,
@@ -855,7 +850,6 @@ export default function (cmd: ModApi): void {
 		if (typeof payload.stopReason === 'string') record.stopReason = payload.stopReason;
 		history.push(record);
 		current = undefined;
-		pendingEnd = undefined;
 		resetRate();
 		save(sessionId);
 		repaint();
@@ -969,12 +963,11 @@ export default function (cmd: ModApi): void {
 		if (history.length > 0) cmd.ui.notify(summaryLine());
 	});
 
-	// An abort or a non-retryable failure ends the run without a guaranteed run_end after the
-	// interrupted request. The spinner must stop counting it, but the request itself is not
-	// discarded: the host may still deliver its model_request_end with real usage, and the README
-	// promises such a request still counts in the totals and the cache rate.
+	// The host emits these from inside the run loop and breaks out before model_request_end, so an
+	// aborted request has no usage to record — there is no row to write. The spinner must stop
+	// counting it, though, and run_end follows immediately, so releasing live state here is what
+	// keeps a phantom request off the spinner.
 	const abortCurrent = (): void => {
-		if (current) pendingEnd = current;
 		current = undefined;
 		resetRate();
 		finishOrphanedSubagents();

@@ -121,6 +121,9 @@ declare module '@commandcode/harness' {
 		delete(key: string): Promise<void>;
 	}
 
+	// The real host passes sessionId only when the bound session has one
+	// (`...e.sessionId ? {sessionId: e.sessionId} : {}`), so it is honestly optional; the mod
+	// falls back to run_start's sessionId.
 	export interface ModHooks {
 		onSessionStart?(input: {source: string; sessionId?: string}): void;
 		onSessionEnd?(input: {reason: string}): void;

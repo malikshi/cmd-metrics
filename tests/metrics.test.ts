@@ -1034,27 +1034,6 @@ test('an aborted request is dropped when interrupted, not left running', () => {
 	assert.match(h.command().message, /no completed model requests yet/);
 });
 
-test('an aborted request still lands its usage when the host reports it late', () => {
-	const h = createHarness();
-	h.emit('run_start');
-	h.emit('model_request_start', {model: 'm/one'});
-	advance(400);
-	h.emit('text_delta', {delta: 'x'});
-	advance(600);
-	h.emit('interrupted');
-	// The README promises such a request still counts in the request total, tokens and cache rate.
-	h.emit('model_request_end', {
-		usage: {inputTokens: 1_000, outputTokens: 40, cacheReadTokens: 800},
-		stopReason: 'interrupted',
-	});
-
-	const text = flat(h.pane());
-	assert.match(text, /#1/);
-	assert.match(text, /40 tok/);
-	assert.match(text, /cache 80%/);
-	assert.match(h.command().message, /1 request/);
-});
-
 test('an abort keeps the session history it already had', () => {
 	const h = createHarness();
 	h.emit('run_start');
