@@ -18,6 +18,7 @@ so the per-request numbers on the spinner never hide the trend:
 
 ```
 session TTFT 1.8s  87 t/s  ⏱ 3.4s  cache 51%  42k tok
+⑂3 TTFT 2.6s  9.4k t/s  ⏱ 41s  20k tok avg
 ```
 
 | Field | Meaning |
@@ -28,7 +29,21 @@ session TTFT 1.8s  87 t/s  ⏱ 3.4s  cache 51%  42k tok
 | **cache** | Token-weighted `ΣcacheRead ÷ Σinput` for the session. |
 | **tok** | Total tokens this session — input + output for every request, plus every sub-agent's tokens. |
 
-The averages stay request-only on purpose: a sub-agent's TTFT is approximate, so it is not
+The second line appears once the session has spawned a sub-agent. It averages the same fields
+over the stored child records, plus each child's token total:
+
+| Field | Meaning |
+|---|---|
+| **⑂n** | How many sub-agents this session. |
+| **TTFT** | Mean spawn → first forwarded child event. Approximate, so it gets its own line instead of being folded into the parent average. |
+| **t/s** | Mean child `tokens ÷ (duration − TTFT)`. |
+| **⏱** | Mean child wall time, from the `<usage>` block when the tool result carries one. |
+| **tok avg** | Mean tokens per child. |
+
+Sub-agent **cache** has no figure: a child carries no prompt accounting, so there is nothing to
+divide.
+
+The parent averages stay request-only on purpose: a sub-agent's TTFT is approximate, so it is not
 mixed into a measured one. Its tokens still count toward the total, because each child is its
 own inference call. `/metrics` repeats the same figures as a one-line summary.
 
@@ -127,7 +142,7 @@ implying token-level precision. Its duration, token count and TPS are exact.
 ## Development
 
 ```bash
-npm test        # 41 unit tests, no build step (node --experimental-strip-types)
+npm test        # 45 unit tests, no build step (node --experimental-strip-types)
 npm run typecheck
 ```
 

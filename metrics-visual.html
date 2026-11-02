@@ -217,6 +217,9 @@
       <div><span class="d">session</span> <span class="g">TTFT 1.8s</span>
         <span class="c">168 t/s</span> <span>⏱ 2.6s</span>
         <span class="y">cache 56%</span> <span class="m">94k tok</span></div>
+      <div style="margin-top:2px"><span class="m">⑂3</span>
+        <span class="g">TTFT 2.6s</span> <span class="m">9.4k t/s</span>
+        <span>⏱ 41s</span> <span class="d">20k tok avg</span></div>
       <hr class="boxhr">
       <div class="prompt">› <span class="cur">█</span></div>
       <div class="status" style="margin-top:8px">status row · mod segments render here after built-ins</div>
@@ -249,6 +252,7 @@
       <div class="kv"><span>sub-agent TTFT</span><span class="y">spawn → first forwarded event</span></div>
       <div class="kv"><span>sub-agent TPS · duration</span><span class="g">exact</span></div>
       <div class="kv"><span>child first-token time</span><span class="d">not observable</span></div>
+      <div class="kv"><span>sub-agent cache %</span><span class="d">no prompt accounting</span></div>
       <div class="kv"><span>unobserved first token (cancelled)</span><span class="d">TTFT — · TPS —</span></div>
       <div class="kv"><span>session figures across a reload</span><span class="g">restored by sessionId</span></div>
       <div class="kv"><span>older sessions</span><span class="g">own key · last 20 kept</span></div>
@@ -261,7 +265,7 @@
 
   <p class="cap" style="margin-top:38px">
     Files: <code>status-metrics.ts</code> (<code>sessionAverages()</code>, <code>below-editor</code> widget) ·
-    <code>tests/metrics.test.ts</code> (41 tests) · <code>README.md</code>
+    <code>tests/metrics.test.ts</code> (45 tests) · <code>README.md</code>
   </p>
 
 </div>

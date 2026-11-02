@@ -72,6 +72,10 @@ interface RequestMetric {
 interface SubagentMetric {
 	tokens?: number;
 	tokensUsed?: number;
+	ttftMs?: number;
+	durationMs?: number;
+	tps?: number;
+	toolCalls?: number;
 }
 
 // What cmd.store keeps in ~/.commandcode/mods/.store/status-metrics.json. The sessionId is the
@@ -91,6 +95,13 @@ export interface SessionAverages {
 	avgDurationMs?: number;
 	cachePercent?: number;
 	totalTokens: number;
+	// Kept as their own block rather than folded into the parent averages above: a child's
+	// TTFT is spawn → first forwarded event, which is not comparable with a measured one.
+	subagentAvgTtftMs?: number;
+	subagentAvgTps?: number;
+	subagentAvgDurationMs?: number;
+	subagentAvgTokens?: number;
+	subagentToolCalls?: number;
 }
 
 interface TextNode {
@@ -210,6 +221,22 @@ export function sessionAverages(
 	);
 	if (avgDurationMs !== undefined) averages.avgDurationMs = avgDurationMs;
 	if (totalInput > 0) averages.cachePercent = (totalCacheRead / totalInput) * 100;
+
+	// Sub-agent figures are derived from the same stored records, each already finalised. They
+	// stay in their own fields so a parent average and a child average are never confused.
+	const definedOnly = (values: (number | undefined)[]): number[] =>
+		values.filter((value): value is number => value !== undefined);
+	const subagentTtft = averageOf(definedOnly(subagents.map(subagent => subagent.ttftMs)));
+	if (subagentTtft !== undefined) averages.subagentAvgTtftMs = subagentTtft;
+	const subagentTps = averageOf(definedOnly(subagents.map(subagent => subagent.tps)));
+	if (subagentTps !== undefined) averages.subagentAvgTps = subagentTps;
+	const subagentDuration = averageOf(definedOnly(subagents.map(subagent => subagent.durationMs)));
+	if (subagentDuration !== undefined) averages.subagentAvgDurationMs = subagentDuration;
+	const perSubagentTokens = definedOnly(subagents.map(subagent => subagent.tokensUsed));
+	if (perSubagentTokens.length > 0) averages.subagentAvgTokens = averageOf(perSubagentTokens);
+	const perSubagentToolCalls = definedOnly(subagents.map(subagent => subagent.toolCalls));
+	if (perSubagentToolCalls.length > 0)
+		averages.subagentToolCalls = averageOf(perSubagentToolCalls);
 	return averages;
 }
 
@@ -432,25 +459,24 @@ export default function (cmd: ModApi): void {
 		if (stats.cachePercent !== undefined) parts.push(`cache ${formatPercent(stats.cachePercent)}`);
 		parts.push(`total ${formatTokens(stats.totalTokens)} tok`);
 		if (stats.subagents > 0) {
-			const subagentTtfts = [...subagents.values()]
-				.map(subagent => subagent.ttftMs)
-				.filter((ttft): ttft is number => ttft !== undefined);
-			const subagentRates = [...subagents.values()]
-				.map(subagent => subagentRate(subagent))
-				.filter((tps): tps is number => tps !== undefined);
+			// The child rates come from the same aggregate the widget reads, so the summary and
+			// the widget can never disagree about what a sub-agent averaged.
 			let subagentPart = `${stats.subagents} sub-agent(s)`;
-			const subagentAvgTtft = averageOf(subagentTtfts);
-			if (subagentAvgTtft !== undefined)
-				subagentPart += ` avg TTFT ${formatDuration(subagentAvgTtft)}`;
-			const subagentAvgRate = averageOf(subagentRates);
-			if (subagentAvgRate !== undefined) subagentPart += ` avg ${formatRate(subagentAvgRate)}`;
+			if (stats.subagentAvgTtftMs !== undefined)
+				subagentPart += ` avg TTFT ${formatDuration(stats.subagentAvgTtftMs)}`;
+			if (stats.subagentAvgTps !== undefined)
+				subagentPart += ` avg ${formatRate(stats.subagentAvgTps)}`;
+			if (stats.subagentAvgDurationMs !== undefined)
+				subagentPart += ` avg ${formatDuration(stats.subagentAvgDurationMs)}`;
+			if (stats.subagentToolCalls !== undefined)
+				subagentPart += ` · ${Math.round(stats.subagentToolCalls)} tool call(s) each`;
 			parts.push(subagentPart);
 		}
 		return parts.join(' · ');
 	};
 
 	const avgWidgetLines = (): Line[] => {
-		if (history.length === 0) {
+		if (history.length === 0 && subagents.size === 0) {
 			// Keep the placement occupied: an empty render would drop the line entirely, which
 			// reads as "the mod stopped working" rather than "no requests yet".
 			return [
@@ -474,7 +500,41 @@ export default function (cmd: ModApi): void {
 		if (stats.cachePercent !== undefined)
 			nodes.push({type: 'text', text: `cache ${formatPercent(stats.cachePercent)}`, color: 'yellow'});
 		nodes.push({type: 'text', text: `${formatTokens(stats.totalTokens)} tok`, color: 'magenta'});
-		return [{type: 'row', children: nodes}];
+		const lines: Line[] = [{type: 'row', children: nodes}];
+
+		if (stats.subagents > 0) {
+			// A child's TTFT is approximate, so it gets its own line rather than sharing the
+			// parent row where it could read as a measured figure.
+			const childNodes: TextNode[] = [
+				{type: 'text', text: `⑂${stats.subagents}`, color: 'magenta'},
+			];
+			if (stats.subagentAvgTtftMs !== undefined)
+				childNodes.push({
+					type: 'text',
+					text: `TTFT ${formatDuration(stats.subagentAvgTtftMs)}`,
+					color: 'green',
+				});
+			if (stats.subagentAvgTps !== undefined)
+				childNodes.push({
+					type: 'text',
+					text: formatRate(stats.subagentAvgTps),
+					color: 'magenta',
+				});
+			if (stats.subagentAvgDurationMs !== undefined)
+				childNodes.push({
+					type: 'text',
+					text: `⏱ ${formatDuration(stats.subagentAvgDurationMs)}`,
+					color: 'white',
+				});
+			if (stats.subagentAvgTokens !== undefined)
+				childNodes.push({
+					type: 'text',
+					text: `${formatTokens(stats.subagentAvgTokens)} tok avg`,
+					dim: true,
+				});
+			lines.push({type: 'row', children: childNodes});
+		}
+		return lines;
 	};
 
 	const requestLines = (): Line[] => {

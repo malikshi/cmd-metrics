@@ -503,6 +503,76 @@ test('sessionAverages reports no averages for an empty session', () => {
 	assert.equal(stats.totalTokens, 0);
 });
 
+test('sessionAverages reports sub-agent averages in their own fields', () => {
+	const stats = sessionAverages(
+		[{ttftMs: 400, tps: 100, durationMs: 1_000, inputTokens: 1_000, outputTokens: 50}],
+		[
+			{ttftMs: 500, tps: 200, durationMs: 2_000, tokensUsed: 1_000, toolCalls: 2},
+			{ttftMs: 1_500, tps: 400, durationMs: 4_000, tokensUsed: 3_000, toolCalls: 4},
+		],
+	);
+	assert.equal(stats.subagentAvgTtftMs, 1_000);
+	assert.equal(stats.subagentAvgTps, 300);
+	assert.equal(stats.subagentAvgDurationMs, 3_000);
+	assert.equal(stats.subagentAvgTokens, 2_000);
+	assert.equal(stats.subagentToolCalls, 3);
+	// The parent averages are untouched by the children.
+	assert.equal(stats.avgTtftMs, 400);
+	assert.equal(stats.avgTps, 100);
+	assert.equal(stats.avgDurationMs, 1_000);
+});
+
+test('sub-agent averages skip records that never produced a figure', () => {
+	const stats = sessionAverages([], [{tokens: 500}, {tokensUsed: 1_500, durationMs: 2_000}]);
+	// Only the finalised record contributes a duration; neither carries a rate.
+	assert.equal(stats.subagentAvgDurationMs, 2_000);
+	assert.equal(stats.subagentAvgTtftMs, undefined);
+	assert.equal(stats.subagentAvgTps, undefined);
+	// tokensUsed wins over the running count.
+	assert.equal(stats.subagentAvgTokens, 1_500);
+});
+
+test('sub-agent averages survive a reload, since the records are stored', async () => {
+	const store = new Map<string, unknown>();
+	const first = createHarness(store);
+	first.hooks().onSessionStart({source: 'startup', sessionId: 'sess-sub'});
+	first.emit('run_start');
+	first.emit('subagent_start', {toolCallId: 'c1', subagentType: 'explore', description: 'find'});
+	advance(500);
+	first.emit('subagent_progress', {toolCallId: 'c1', tokensUsed: 1_000});
+	advance(1_500);
+	first.emit('subagent_stop', {toolCallId: 'c1', tokensUsed: 20_370});
+	await flushWrites();
+
+	const reloaded = createHarness(store);
+	reloaded.hooks().onSessionStart({source: 'reload', sessionId: 'sess-sub'});
+	const text = flat(reloaded.widget());
+	assert.match(text, /⑂1/);
+	assert.match(text, /TTFT 0\.50s/);
+	assert.match(text, /20k tok avg/);
+});
+
+test('the widget gives sub-agent averages their own line', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/one'});
+	advance(400);
+	h.emit('text_delta', {delta: 'x'});
+	advance(600);
+	h.emit('model_request_end', {usage: {inputTokens: 1_000, outputTokens: 60}});
+	h.emit('subagent_start', {toolCallId: 'c1', subagentType: 'explore', description: 'find'});
+	advance(300);
+	h.emit('subagent_progress', {toolCallId: 'c1', tokensUsed: 100});
+	advance(700);
+	h.emit('subagent_stop', {toolCallId: 'c1', tokensUsed: 900});
+
+	const lines = h.widget();
+	assert.equal(lines.length, 2);
+	// Parent row stays measured; the child row is separate and labelled.
+	assert.match(flat([lines[0]]), /^session \| TTFT/);
+	assert.match(flat([lines[1]]), /⑂1 \| TTFT 0\.30s \| /);
+});
+
 test('below-editor widget shows session averages and total tokens', () => {
 	const h = createHarness();
 	assert.match(flat(h.widget()), /no requests yet/);
