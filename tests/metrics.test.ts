@@ -303,7 +303,7 @@ test('background sub-agent stop carries status', () => {
 	assert.match(flat(h.pane()), /completed/);
 });
 
-test('run_start clears history and sub-agents', () => {
+test('a new run keeps the session aggregates and only clears live state', () => {
 	const h = createHarness();
 	h.emit('run_start');
 	h.emit('model_request_start', {model: 'm/one'});
@@ -313,10 +313,12 @@ test('run_start clears history and sub-agents', () => {
 	h.emit('subagent_start', {toolCallId: 'c1', subagentType: 'general', description: 'd'});
 	assert.match(flat(h.pane()), /#1/);
 
+	// A run is one prompt: the below-editor line must survive the next submit.
 	h.emit('run_start');
 	const text = flat(h.pane());
-	assert.doesNotMatch(text, /#1/);
-	assert.doesNotMatch(text, /⑂/);
+	assert.match(text, /#1/);
+	assert.match(text, /⑂/);
+	assert.match(flat(h.widget()), /session/);
 });
 
 test('/metrics opens the pane and reports a summary', () => {

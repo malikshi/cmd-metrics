@@ -545,9 +545,10 @@ export default function (cmd: ModApi): void {
 		},
 	});
 
+	// A run is one submitted prompt, not one session: clearing the aggregates here would
+	// blank the below-editor line every time a prompt is sent and make "session" means "this
+	// prompt". Only the live request state is per-run; totals reset in the session hooks.
 	cmd.on('run_start', () => {
-		history = [];
-		subagents.clear();
 		reset();
 	});
 
