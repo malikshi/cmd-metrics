@@ -11,6 +11,11 @@ model works.
 | **tokens ÷ (duration − TTFT)** | The rate reported for a finished request, so prefill does not dilute it. |
 | **cache %** | `cacheReadTokens ÷ inputTokens` — how much of the prompt was served from the prompt cache. |
 
+A route that delivers the whole answer in one flush has no generation timeline to measure. Those
+rows fall back to wall clock, which includes prefill, and the rate is prefixed with `~` so it never
+reads as a measured decode speed. A request whose first token was never observed reports no rate
+at all.
+
 ## Session averages
 
 A line under the prompt (`below-editor`) keeps the running averages for the session in view,
@@ -24,7 +29,7 @@ session TTFT 1.8s  87 t/s  ⏱ 3.4s  cache 51%  42k tok
 | Field | Meaning |
 |---|---|
 | **TTFT** | Mean time to first token over completed model requests. |
-| **t/s** | Mean generated tokens per second, each request weighted equally. |
+| **t/s** | Mean generated tokens per second over measured requests, each weighted equally. Requests with no decode timeline (see below) are excluded, and the summary says how many. |
 | **⏱** | Mean wall time of a model request. |
 | **cache** | Token-weighted `ΣcacheRead ÷ Σinput` for the session. |
 | **tok** | Total tokens for the session's model requests only: input + output. |
@@ -142,7 +147,7 @@ implying token-level precision. Its duration, token count and TPS are exact.
 ## Development
 
 ```bash
-npm test        # 51 unit tests, no build step (node --experimental-strip-types)
+npm test        # 69 unit tests, no build step (node --experimental-strip-types)
 npm run typecheck
 ```
 

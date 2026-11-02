@@ -55,6 +55,8 @@ declare module '@commandcode/harness' {
 		  }
 		| {type: 'subagent_stop'; toolCallId: string; subagentType: string; tokensUsed: number}
 		| {type: 'notice'; level: string; message: string}
+		| {type: 'interrupted'}
+		| {type: 'run_error'; error?: unknown}
 		| {type: 'mod_error'; modId: string; hook: string; error: string};
 
 	export interface TextEl {
@@ -82,7 +84,9 @@ declare module '@commandcode/harness' {
 	}
 
 	export interface ModUi {
-		readonly capabilities: {status: boolean; surface: boolean};
+		// Rules:   optional on purpose — hosts before cmdc 1.10.0 have no capabilities property at
+		// all, so an unguarded read throws instead of degrading.
+		readonly capabilities?: {status: boolean; surface: boolean};
 		notify(message: string, level?: 'info' | 'warning' | 'error'): void;
 		toast(text: string, options?: {level?: string; durationMs?: number}): void;
 		setStatus(text: string | null): {dispose(): void};

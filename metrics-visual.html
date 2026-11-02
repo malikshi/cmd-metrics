@@ -138,6 +138,8 @@ agent:   claude-sonnet-4 | anthropic | 2026-11-02 | code-review | removed sectio
     </div>
     <p class="cap">Why subtract TTFT? Prefill is not generation. Dividing 132 ÷ 2.1s would report 63 t/s
       and blame the model for a slow prompt read. The mod never does that.</p>
+    <p class="cap">If a route delivers the whole answer in one flush, there is no generation timeline
+      to measure: the rate falls back to wall clock and the row prefixes it with <b>~</b>.</p>
   </div>
   <h2>2 · cache % — how much of the prompt was reused</h2>
   <div class="panel">

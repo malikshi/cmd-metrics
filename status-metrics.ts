@@ -44,6 +44,8 @@ interface RequestRecord {
 	cacheWriteTokens?: number;
 	cachePercent?: number;
 	tps?: number;
+	// Rules:   set when tps fell back to wall clock, so the row can mark the figure approximate.
+	wallClockRate?: boolean;
 	stopReason?: string;
 }
 
@@ -67,6 +69,8 @@ interface SubagentRecord {
 interface RequestMetric {
 	ttftMs?: number;
 	tps?: number;
+	// Rules:   a wall-clock rate has no decode timeline; it is marked so aggregates can exclude it.
+	wallClockRate?: boolean;
 	durationMs?: number;
 	inputTokens?: number;
 	outputTokens?: number;
@@ -107,6 +111,9 @@ export interface SessionAverages {
 	subagentAvgTps?: number;
 	subagentAvgDurationMs?: number;
 	subagentToolCalls?: number;
+	// How many parent requests had no decode timeline, so their rate is wall clock and excluded
+	// from avgTps. Absent when every request was measured.
+	wallClockRequests?: number;
 }
 
 interface TextNode {
@@ -222,10 +229,19 @@ export function sessionAverages(
 		requests.map(record => record.ttftMs).filter((ttft): ttft is number => ttft !== undefined),
 	);
 	if (avgTtftMs !== undefined) averages.avgTtftMs = avgTtftMs;
+	// Rules:   a wall-clock rate includes prefill, so it is a different measurement — averaging it
+	// with a decode rate would publish a figure neither of them is. Only measured rates average.
 	const avgTps = averageOf(
-		requests.map(record => record.tps).filter((tps): tps is number => tps !== undefined),
+		requests
+			.map(record => (record.wallClockRate ? undefined : record.tps))
+			.filter((tps): tps is number => tps !== undefined),
 	);
 	if (avgTps !== undefined) averages.avgTps = avgTps;
+	// Rules:   the count travels with the average, so a caller can say how many rates it covers.
+	const measuredRates = requests.filter(
+		record => !record.wallClockRate && record.tps !== undefined,
+	).length;
+	if (measuredRates < requests.length) averages.wallClockRequests = requests.length - measuredRates;
 	const avgDurationMs = averageOf(
 		requests
 			.map(record => record.durationMs)
@@ -299,6 +315,9 @@ export default function (cmd: ModApi): void {
 	let samples: {at: number; tokens: number}[] = [];
 	let smoothed: number | undefined;
 	let lastTokenAt = 0;
+	// A request interrupted before its usage event arrived. Kept so a late model_request_end can
+	// still record the row, while the live spinner state is already released.
+	let pendingEnd: RequestRecord | undefined;
 
 	const resetRate = (): void => {
 		samples = [];
@@ -308,6 +327,7 @@ export default function (cmd: ModApi): void {
 
 	const reset = (): void => {
 		current = undefined;
+		pendingEnd = undefined;
 		resetRate();
 	};
 
@@ -323,6 +343,14 @@ export default function (cmd: ModApi): void {
 		history = requests.filter(
 			(record): record is RequestRecord => isRecord(record) && typeof record.model === 'string',
 		);
+		// Rules:   the file may hold rows written before wall-clock marking existed. A rate above
+		// TPS_MAX was never a decode rate, so it must not enter the measured average either.
+		for (const record of history) {
+			if (typeof record.tps === 'number' && record.tps > TPS_MAX) {
+				record.tps = undefined;
+				record.wallClockRate = true;
+			}
+		}
 		subagents.clear();
 		for (const subagent of Array.isArray(stored.subagents) ? stored.subagents : []) {
 			if (!isRecord(subagent) || typeof subagent.toolCallId !== 'string') continue;
@@ -360,8 +388,10 @@ export default function (cmd: ModApi): void {
 		if (id === undefined) return;
 		const snapshot: PersistedSession = {
 			sessionId: id,
-			requests: history,
-			subagents: [...subagents.values()],
+			// Rules:   copy by value — the write is queued, and the live array/records keep being
+			// mutated by later events, so a reference would persist a state the mod never had.
+			requests: history.slice(),
+			subagents: [...subagents.values()].map(subagent => ({...subagent})),
 		};
 		const key = sessionKey(id);
 		enqueueWrite(async () => {
@@ -483,6 +513,8 @@ export default function (cmd: ModApi): void {
 		const parts = [`metrics: ${stats.requests} request(s)`];
 		if (stats.avgTtftMs !== undefined) parts.push(`avg TTFT ${formatDuration(stats.avgTtftMs)}`);
 		if (stats.avgTps !== undefined) parts.push(`avg ${formatRate(stats.avgTps)}`);
+		if (stats.wallClockRequests !== undefined)
+			parts.push(`${stats.wallClockRequests} wall-clock rate(s) excluded`);
 		if (stats.avgDurationMs !== undefined)
 			parts.push(`avg duration ${formatDuration(stats.avgDurationMs)}`);
 		if (stats.cachePercent !== undefined) parts.push(`cache ${formatPercent(stats.cachePercent)}`);
@@ -614,7 +646,15 @@ export default function (cmd: ModApi): void {
 					{type: 'text', text: `⏱ ${formatDuration(record.durationMs)}`},
 					{type: 'text', text: `${formatTokens(record.outputTokens ?? 0)} tok`, dim: true},
 					{type: 'text', text: `cache ${formatPercent(record.cachePercent)}`, color: 'yellow'},
-					{type: 'text', text: formatRate(record.tps), color: 'cyan'},
+					{
+						type: 'text',
+						// Rules:   only a rate that exists can be approximate — never render `~—`.
+						text:
+							record.wallClockRate && record.tps !== undefined
+								? `~${formatRate(record.tps)}`
+								: formatRate(record.tps),
+						color: 'cyan',
+					},
 					...(record.stopReason ? [{type: 'text' as const, text: record.stopReason, dim: true}] : []),
 				],
 			});
@@ -718,7 +758,9 @@ export default function (cmd: ModApi): void {
 		name: 'metrics',
 		description: 'Show TPS, TTFT, and duration for each model request and sub-agent',
 		handler: () => {
-			if (cmd.ui.capabilities.surface) cmd.ui.openPane(PANE_ID);
+			// Rules:   capabilities is absent on hosts before cmdc 1.10.0; reading it unguarded
+			// throws inside the command handler. Without it, fall back to the summary string only.
+			if (cmd.ui.capabilities?.surface) cmd.ui.openPane(PANE_ID);
 			return {message: summaryLine()};
 		},
 	});
@@ -726,7 +768,20 @@ export default function (cmd: ModApi): void {
 	// A run is one submitted prompt, not one session: clearing the aggregates here would
 	// blank the below-editor line every time a prompt is sent and make "session" means "this
 	// prompt". Only the live request state is per-run; totals reset in the session hooks.
-	cmd.on('run_start', () => {
+	cmd.on('run_start', event => {
+		// Rules:   adopt the run's id only when no session id is known AND nothing has been
+		// collected yet — restore() replaces history wholesale, so adopting a late id after a
+		// request has already landed under the anonymous session would silently discard it.
+		const id = (event as {sessionId?: unknown}).sessionId;
+		if (
+			sessionId === undefined &&
+			typeof id === 'string' &&
+			history.length === 0 &&
+			subagents.size === 0
+		) {
+			sessionId = id;
+			restore(id);
+		}
 		reset();
 	});
 
@@ -750,24 +805,38 @@ export default function (cmd: ModApi): void {
 	cmd.on('message_update', markFirstToken);
 
 	cmd.on('model_request_end', event => {
-		if (!current) return;
+		// Rules:   an aborted request keeps a pending record so its late usage still lands — the
+		// README promises an interrupted request counts in the totals and the cache rate.
+		const record0 = current ?? pendingEnd;
+		if (!record0) return;
 		const payload = event as {usage?: Usage; stopReason?: unknown};
 		const endedAt = Date.now();
-		const durationMs = endedAt - current.startedAt;
+		const durationMs = endedAt - record0.startedAt;
 		// A request whose first token was never observed has no TTFT. Recording the duration
 		// instead would turn prefill into a measured TTFT and drag the session average up.
 		const ttftMs =
-			current.firstTokenAt === undefined
-				? undefined
-				: current.firstTokenAt - current.startedAt;
+			record0.firstTokenAt === undefined ? undefined : record0.firstTokenAt - record0.startedAt;
 		const outputTokens = Number(payload.usage?.outputTokens ?? 0) || 0;
 		const generationMs = ttftMs === undefined ? undefined : durationMs - ttftMs;
-		const tps =
-			outputTokens > 0 && generationMs !== undefined && generationMs > 0
-				? outputTokens / (generationMs / 1_000)
+		// Rules:   a rate above TPS_MAX is not decoding — it is a flushed answer divided by the
+		// milliseconds its transport took. The live path already refuses that as a counter jump;
+		// here it means there is no decode timeline, so report wall clock and say so. Deciding by
+		// the impossible value rather than by stream shape keeps a short genuine stream (a couple
+		// of chunks, a handful of tokens) measured instead of downgraded.
+		const decodeMs = generationMs !== undefined && generationMs > 0 ? generationMs : undefined;
+		const decodeRate = decodeMs !== undefined && outputTokens > 0 ? outputTokens / (decodeMs / 1_000) : undefined;
+		const wallClockRate = decodeRate === undefined || decodeRate > TPS_MAX;
+		const measuredMs = wallClockRate ? durationMs : decodeMs;
+		const rawTps =
+			ttftMs !== undefined && outputTokens > 0 && measuredMs !== undefined && measuredMs > 0
+				? outputTokens / (measuredMs / 1_000)
 				: undefined;
+		// Rules:   the wall-clock rate is bounded too, so a few-millisecond request cannot publish a
+		// fantasy figure by either route.
+		const tps = rawTps !== undefined && rawTps <= TPS_MAX ? rawTps : undefined;
+		const isWallClockRate = wallClockRate && tps !== undefined;
 		const record: RequestRecord = {
-			...current,
+			...record0,
 			endedAt,
 			durationMs,
 			outputTokens,
@@ -782,9 +851,11 @@ export default function (cmd: ModApi): void {
 		const cached = cachePercent(payload.usage);
 		if (cached !== undefined) record.cachePercent = cached;
 		if (tps !== undefined) record.tps = tps;
+		if (isWallClockRate) record.wallClockRate = true;
 		if (typeof payload.stopReason === 'string') record.stopReason = payload.stopReason;
 		history.push(record);
 		current = undefined;
+		pendingEnd = undefined;
 		resetRate();
 		save(sessionId);
 		repaint();
@@ -857,6 +928,24 @@ export default function (cmd: ModApi): void {
 		repaint();
 	});
 
+	// A child whose run was aborted never receives subagent_stop, so it would keep rendering as
+	// running with a duration that grows forever — and get persisted that way. Close the ones the
+	// abort orphans. Background children outlive a single run, so they are left alone.
+	// Rules:   a child that never emitted a progress event was likely never started; drop it rather
+	// than persist a zero-duration phantom.
+	const finishOrphanedSubagents = (): void => {
+		for (const [id, subagent] of subagents) {
+			if (subagent.endedAt !== undefined) continue;
+			if (subagent.firstActivityAt === undefined) {
+				subagents.delete(id);
+				continue;
+			}
+			subagent.endedAt = Date.now();
+			subagent.status = 'interrupted';
+			finalizeSubagent(subagent);
+		}
+	};
+
 	cmd.on('tool_completed', event => {
 		const payload = event as {toolCallId?: unknown; toolName?: unknown; result?: unknown};
 		if (payload.toolName !== 'agent' || typeof payload.toolCallId !== 'string') return;
@@ -879,6 +968,21 @@ export default function (cmd: ModApi): void {
 		reset();
 		if (history.length > 0) cmd.ui.notify(summaryLine());
 	});
+
+	// An abort or a non-retryable failure ends the run without a guaranteed run_end after the
+	// interrupted request. The spinner must stop counting it, but the request itself is not
+	// discarded: the host may still deliver its model_request_end with real usage, and the README
+	// promises such a request still counts in the totals and the cache rate.
+	const abortCurrent = (): void => {
+		if (current) pendingEnd = current;
+		current = undefined;
+		resetRate();
+		finishOrphanedSubagents();
+		save(sessionId);
+		repaint();
+	};
+	cmd.on('interrupted', abortCurrent);
+	cmd.on('run_error', abortCurrent);
 
 	// Rules:   a hot reload and a /reload restart both arrive with the same sessionId, so restore the stored figures instead of wiping them — the factory re-runs and memory is gone, so cmd.store is the only source. A different or older session starts from zero.
 	cmd.hooks({

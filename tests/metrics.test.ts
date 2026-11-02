@@ -22,7 +22,7 @@ const {
 
 function createHarness(
 	sharedStore?: Map<string, unknown>,
-	options: {failWrites?: boolean} = {},
+	options: {failWrites?: boolean; omitCapabilities?: boolean} = {},
 ) {
 	const handlers = new Map<string, Array<(event: any) => void>>();
 	const overrides = new Map<string, (props: any, next?: () => any) => any>();
@@ -35,6 +35,10 @@ function createHarness(
 	const store = sharedStore ?? new Map<string, unknown>();
 	let storeInFlight = 0;
 	let storeOverlaps = 0;
+	// Per-harness, so one test's pane open cannot leak into the next.
+	let openedPane: string | undefined;
+	// Every value handed to set(), so a test can check what a queued write actually captured.
+	const writes: Array<{key: string; value: any}> = [];
 
 	const cmd: any = {
 		on: (type: string, handler: (event: any) => void) => {
@@ -52,7 +56,10 @@ function createHarness(
 			return {dispose() {}};
 		},
 		ui: {
-			capabilities: {surface: true, status: true},
+			// Rules:   an old host has no capabilities property at all; omitCapabilities models that.
+			...(options.omitCapabilities
+				? {}
+				: {capabilities: {surface: true, status: true}}),
 			override: (component: string, render: any) => {
 				overrides.set(component, render);
 				return {dispose() {}};
@@ -62,7 +69,7 @@ function createHarness(
 				return {dispose() {}};
 			},
 			openPane: (id: string) => {
-				(createHarness as any).openedPane = id;
+				openedPane = id;
 			},
 			widget: (widget: any) => {
 				widgets.push(widget);
@@ -86,6 +93,7 @@ function createHarness(
 			// Rules:   each set is a whole-file read-modify-write that yields before landing, so overlapping writes would interleave; storeOverlaps counts them.
 			set: async (key: string, value: unknown) => {
 				if (options.failWrites) throw new Error('store unavailable');
+				writes.push({key, value});
 				if (storeInFlight > 0) storeOverlaps += 1;
 				storeInFlight += 1;
 				await new Promise(resolve => setTimeout(resolve, 0));
@@ -127,7 +135,11 @@ function createHarness(
 		get storeOverlaps() {
 			return storeOverlaps;
 		},
-		openedPane: () => (createHarness as any).openedPane,
+		openedPane: () => openedPane,
+		setSurface: (surface: boolean) => {
+			cmd.ui.capabilities = {surface, status: true};
+		},
+		writes,
 		hooks: () => (createHarness as any).hooks,
 	};
 }
@@ -138,9 +150,11 @@ const flat = (nodes: any[]): string =>
 		.join(' | ');
 
 // Drain the queued store writes before asserting on the store.
-// Rules:   each hop yields, so run every pending microtask and timer callback.
+// Rules:   each hop yields, so run every pending microtask and timer callback. The chain is
+// serialized and each write awaits per key, so a burst of writes needs many hops to fully land —
+// a frozen snapshot makes an under-drained chain visible (the file keeps an earlier write).
 const flushWrites = async (): Promise<void> => {
-	for (let index = 0; index < 10; index += 1) {
+	for (let index = 0; index < 80; index += 1) {
 		await new Promise(resolve => setTimeout(resolve, 0));
 	}
 };
@@ -232,6 +246,107 @@ test('model_request_end records TTFT, duration, tokens and TPS', () => {
 	assert.match(paneText, /90 tok/);
 	assert.match(paneText, /150 t\/s/);
 	assert.match(paneText, /end_turn/);
+});
+
+test('a flush-at-end route reports a wall-clock rate, not a fantasy one', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/flush'});
+	advance(2_000);
+	h.emit('text_delta', {delta: 'whole answer'});
+	h.emit('text_delta', {delta: ' more'});
+	advance(3);
+	// 500 tokens landed 3 ms after the only text: dividing by that span would report ~167k t/s.
+	h.emit('model_request_end', {usage: {outputTokens: 500}, stopReason: 'end_turn'});
+
+	const text = flat(h.pane());
+	assert.match(text, /~250 t\/s/);
+	assert.doesNotMatch(text, /k t\/s/);
+});
+
+test('a flush 200ms before the end is still caught by the rate, not by shape', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/late'});
+	advance(2_000);
+	h.emit('text_delta', {delta: 'a'});
+	h.emit('text_delta', {delta: 'b'});
+	advance(200);
+	// A 200 ms generation span for 500 tokens implies 2.5k t/s — impossible, so wall clock wins.
+	h.emit('model_request_end', {usage: {outputTokens: 500}, stopReason: 'end_turn'});
+
+	const text = flat(h.pane());
+	assert.match(text, /~227 t\/s/);
+	assert.doesNotMatch(text, /2\.5k/);
+});
+
+test('a thinking chunk before a flushed answer stays bounded, never k-scale', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/reason'});
+	advance(300);
+	h.emit('thinking_delta', {delta: 'pondering'});
+	advance(900);
+	h.emit('text_delta', {delta: 'the whole answer'});
+	advance(5);
+	// Reasoning is billed as output, so the span from the thinking token is a real timeline and
+	// 400 tokens over 905 ms is a plausible 442 t/s. What must never happen is a k-scale figure
+	// from dividing by the 5 ms transport tail.
+	h.emit('model_request_end', {usage: {outputTokens: 400}, stopReason: 'end_turn'});
+
+	const text = flat(h.pane());
+	assert.match(text, /442 t\/s/);
+	assert.doesNotMatch(text, /\d+k t\/s/);
+});
+
+test('a short genuine stream keeps its measured rate instead of being downgraded', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/brief'});
+	advance(2_000);
+	h.emit('text_delta', {delta: 'Done.'});
+	advance(200);
+	h.emit('text_delta', {delta: ' Anything else?'});
+	advance(20);
+	// 6 tokens over a 220 ms generation span is a plausible 27 t/s: no downgrade, no `~`.
+	h.emit('model_request_end', {usage: {outputTokens: 6}, stopReason: 'end_turn'});
+
+	const text = flat(h.pane());
+	assert.match(text, /27 t\/s/);
+	assert.doesNotMatch(text, /~/);
+});
+
+test('an absurd wall-clock rate is dropped rather than published', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/instant'});
+	h.emit('text_delta', {delta: 'x'});
+	advance(5);
+	// Even wall clock cannot make 500 tokens in 5 ms real; the row reports no rate at all.
+	h.emit('model_request_end', {usage: {outputTokens: 500}, stopReason: 'end_turn'});
+
+	// The header mentions t/s, so assert on a rendered rate, not on the word.
+	const text = flat(h.pane());
+	assert.doesNotMatch(text, /\d+(\.\d+)?\s?[kM]? t\/s\b(?! =)/);
+	assert.doesNotMatch(text, /~—/);
+});
+
+test('a normally streamed request still divides by generation time', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/stream'});
+	advance(400);
+	for (let index = 0; index < 5; index += 1) {
+		advance(120);
+		h.emit('text_delta', {delta: 'chunk'});
+	}
+	advance(100);
+	h.emit('model_request_end', {usage: {outputTokens: 100}, stopReason: 'end_turn'});
+
+	const text = flat(h.pane());
+	// TTFT 0.52s, duration 1.1s → 100 tokens over 0.58s of generation.
+	assert.match(text, /172 t\/s/);
+	assert.doesNotMatch(text, /~/);
 });
 
 test('spinner falls back to the last completed request between requests', () => {
@@ -870,6 +985,17 @@ test('formatPercent never prints 10.0% at the boundary', () => {
 	assert.equal(formatPercent(9.94), '9.9%');
 });
 
+test('a wall-clock rate is excluded from the measured average', () => {
+	// One measured 200 t/s request plus one flush whose wall-clock rate is 50 t/s.
+	const stats = sessionAverages([
+		{tps: 200, wallClockRate: false},
+		{tps: 50, wallClockRate: true},
+	]);
+	// Mixing them would report 125 t/s, a figure neither request supports.
+	assert.equal(stats.avgTps, 200);
+	assert.equal(stats.wallClockRequests, 1);
+});
+
 test('session cache rate is clamped like the per-request rate', () => {
 	// cacheReadTokens exceeding inputTokens is nonsense; the row clamps to 100, so must the aggregate.
 	const stats = sessionAverages([{inputTokens: 1_000, cacheReadTokens: 2_000}]);
@@ -889,6 +1015,239 @@ test('run_end without model_request_end drops the phantom live request', () => {
 	// No live row, and the spinner must not claim a running request forever.
 	assert.doesNotMatch(flat(h.pane()), /▶/);
 	assert.doesNotMatch(flat(h.spinner(0)), /TTFT 0\.40s/);
+});
+
+test('an aborted request is dropped when interrupted, not left running', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/one'});
+	advance(400);
+	h.emit('text_delta', {delta: 'x'});
+	advance(600);
+	// Ctrl-C mid-stream: the host emits interrupted, never model_request_end.
+	h.emit('interrupted');
+
+	assert.doesNotMatch(flat(h.pane()), /▶/);
+	assert.doesNotMatch(flat(h.spinner(0)), /TTFT 0\.40s/);
+	// No usage ever arrived, so there is nothing to record — and no phantom row either.
+	assert.doesNotMatch(flat(h.pane()), /#1/);
+	assert.match(h.command().message, /no completed model requests yet/);
+});
+
+test('an aborted request still lands its usage when the host reports it late', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/one'});
+	advance(400);
+	h.emit('text_delta', {delta: 'x'});
+	advance(600);
+	h.emit('interrupted');
+	// The README promises such a request still counts in the request total, tokens and cache rate.
+	h.emit('model_request_end', {
+		usage: {inputTokens: 1_000, outputTokens: 40, cacheReadTokens: 800},
+		stopReason: 'interrupted',
+	});
+
+	const text = flat(h.pane());
+	assert.match(text, /#1/);
+	assert.match(text, /40 tok/);
+	assert.match(text, /cache 80%/);
+	assert.match(h.command().message, /1 request/);
+});
+
+test('an abort keeps the session history it already had', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/first'});
+	advance(200);
+	h.emit('text_delta', {delta: 'x'});
+	advance(800);
+	h.emit('model_request_end', {usage: {outputTokens: 20}});
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/second'});
+	advance(300);
+	h.emit('interrupted');
+
+	// The completed request must not be erased by the abort of the next one.
+	assert.match(h.command().message, /1 request/);
+	assert.match(flat(h.pane()), /first/);
+});
+
+test('an abort closes the sub-agents it orphans instead of leaving them running', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('subagent_start', {toolCallId: 'c1', subagentType: 'explore', description: 'find'});
+	advance(500);
+	h.emit('subagent_progress', {toolCallId: 'c1', tokensUsed: 1_000, toolName: 'grep'});
+	advance(500);
+	h.emit('interrupted');
+
+	const text = flat(h.pane());
+	assert.match(text, /✓/);
+	assert.doesNotMatch(text, /▶/);
+	assert.match(text, /interrupted/);
+});
+
+test('a non-retryable run_error also drops the live request', () => {
+	const h = createHarness();
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/one'});
+	advance(250);
+	h.emit('text_delta', {delta: 'x'});
+	advance(500);
+	h.emit('run_error', {error: new Error('boom')});
+
+	assert.doesNotMatch(flat(h.pane()), /▶/);
+	assert.doesNotMatch(flat(h.spinner(0)), /TTFT 0\.25s/);
+});
+
+test('a run_start session id is adopted when the hook carried none', async () => {
+	const store = new Map<string, unknown>();
+	const first = createHarness(store);
+	// The host answered onSessionStart without an id, so run_start is the only source.
+	first.hooks().onSessionStart({source: 'startup'});
+	first.emit('run_start', {sessionId: 'sess-adopted'});
+	first.emit('model_request_start', {model: 'm/one'});
+	advance(300);
+	first.emit('text_delta', {delta: 'x'});
+	advance(700);
+	first.emit('model_request_end', {usage: {inputTokens: 1_000, outputTokens: 20}});
+	await flushWrites();
+
+	assert.equal(store.has('session:sess-adopted'), true);
+	const resumed = createHarness(store);
+	resumed.hooks().onSessionStart({source: 'startup', sessionId: 'sess-adopted'});
+	assert.match(resumed.command().message, /1 request/);
+});
+
+test('a later run_start does not rewind an established session', () => {
+	const store = new Map<string, unknown>();
+	store.set('session:sess-x', {
+		sessionId: 'sess-x',
+		requests: [{model: 'm/other', startedAt: 0, outputTokens: 5}],
+		subagents: [],
+	});
+	// The other session has figures of its own, so adopting its id would visibly replace ours.
+	store.set('session:sess-other', {
+		sessionId: 'sess-other',
+		requests: [{model: 'm/stolen', startedAt: 0, outputTokens: 999}],
+		subagents: [],
+	});
+	const h = createHarness(store);
+	h.hooks().onSessionStart({source: 'startup', sessionId: 'sess-x'});
+	h.emit('run_start', {sessionId: 'sess-x'});
+	h.emit('model_request_start', {model: 'm/mine'});
+	advance(100);
+	h.emit('text_delta', {delta: 'x'});
+	h.emit('model_request_end', {usage: {outputTokens: 5}});
+	// A nested run arriving with another id must not swap the session out from under us.
+	h.emit('run_start', {sessionId: 'sess-other'});
+
+	assert.match(h.command().message, /2 request/);
+	assert.match(flat(h.pane()), /other/);
+	assert.match(flat(h.pane()), /mine/);
+	assert.doesNotMatch(flat(h.pane()), /stolen/);
+});
+
+test('a stored session keeps its id when a later run_start names another one', () => {
+	const store = new Map<string, unknown>();
+	store.set('session:sess-x', {
+		sessionId: 'sess-x',
+		requests: [{model: 'm/other', startedAt: 0, outputTokens: 5}],
+		subagents: [],
+	});
+	const h = createHarness(store);
+	h.hooks().onSessionStart({source: 'startup', sessionId: 'sess-x'});
+	h.emit('run_start', {sessionId: 'sess-x'});
+	h.emit('model_request_start', {model: 'm/mine'});
+	advance(100);
+	h.emit('text_delta', {delta: 'x'});
+	h.emit('model_request_end', {usage: {outputTokens: 5}});
+	// A nested run arriving with another id must not swap the session out from under us.
+	h.emit('run_start', {sessionId: 'sess-other'});
+
+	// Nothing may be written under the other session's key.
+	assert.equal(store.has('session:sess-other'), false);
+});
+
+test('a late run_start id must not discard data already collected without one', () => {
+	const store = new Map<string, unknown>();
+	// The id finally arrives, and that session already has stored figures to restore.
+	store.set('session:sess-late', {
+		sessionId: 'sess-late',
+		requests: [{model: 'm/stored', startedAt: 0, outputTokens: 7}],
+		subagents: [],
+	});
+	const h = createHarness(store);
+	// The host answered onSessionStart without an id, so the first request lands anonymously.
+	h.hooks().onSessionStart({source: 'startup'});
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/live-one'});
+	advance(200);
+	h.emit('text_delta', {delta: 'x'});
+	advance(800);
+	h.emit('model_request_end', {usage: {outputTokens: 20}});
+	h.emit('run_start', {sessionId: 'sess-late'});
+
+	// Restoring over live memory would silently drop the request that already happened.
+	assert.match(flat(h.pane()), /live-one/);
+});
+
+test('a host that reports no surface does not try to open the pane', () => {
+	const h = createHarness();
+	h.setSurface(false);
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/one'});
+	advance(200);
+	h.emit('text_delta', {delta: 'x'});
+	h.emit('model_request_end', {usage: {outputTokens: 30}});
+
+	// The summary must still come back as text; only the pane is unavailable.
+	assert.match(h.command().message, /1 request/);
+	assert.equal(h.openedPane(), undefined);
+});
+
+test('a host without ui.capabilities still serves /metrics as text', () => {
+	// Before cmdc 1.10.0 the property is absent; reading it unguarded throws in the handler and
+	// the whole command dies on that host.
+	const h = createHarness(undefined, {omitCapabilities: true});
+	h.emit('run_start');
+	h.emit('model_request_start', {model: 'm/one'});
+	advance(200);
+	h.emit('text_delta', {delta: 'x'});
+	advance(800);
+	h.emit('model_request_end', {usage: {outputTokens: 30}});
+
+	assert.equal(h.openedPane(), undefined);
+	assert.match(h.command().message, /1 request/);
+});
+
+test('a queued save captures a copy, not the live records it was scheduled with', async () => {
+	const store = new Map<string, unknown>();
+	const h = createHarness(store);
+	h.hooks().onSessionStart({source: 'startup', sessionId: 'sess-copy'});
+	h.emit('run_start');
+	h.emit('subagent_start', {toolCallId: 'c1', subagentType: 'explore', description: 'find'});
+	advance(500);
+	// subagent_stop schedules the write, then progress mutates the same record in the same tick.
+	h.emit('subagent_stop', {toolCallId: 'c1', tokensUsed: 100});
+	h.emit('subagent_progress', {toolCallId: 'c1', tokensUsed: 99_999});
+	// A request completing in the same tick must not reach the snapshot already scheduled.
+	h.emit('model_request_start', {model: 'm/late'});
+	advance(100);
+	h.emit('text_delta', {delta: 'x'});
+	h.emit('model_request_end', {usage: {outputTokens: 5}});
+	await flushWrites();
+
+	const firstWrite = h.writes.find(entry => entry.key === 'session:sess-copy')!;
+	// subagent_stop set tokensUsed=100 on the record before scheduling; the later progress event
+	// (tokens = 99,999) mutates the live object, and must not be visible in that snapshot. With a
+	// stored reference this assertion reads 99,999.
+	assert.equal(firstWrite.value.subagents[0].tokens, 0);
+	assert.equal(firstWrite.value.subagents[0].tokensUsed, 100);
+	// The array itself is copied too: a request that lands after the write was scheduled must not
+	// appear in it. With the live array aliased this reads 1.
+	assert.equal(firstWrite.value.requests.length, 0);
 });
 
 test('a failing store write does not crash the mod or lose the in-memory figures', async () => {
